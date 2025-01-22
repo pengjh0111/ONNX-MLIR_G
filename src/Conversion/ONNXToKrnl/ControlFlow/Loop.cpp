@@ -514,19 +514,47 @@ struct ONNXLoopOpLowering : public OpConversionPattern<ONNXLoopOp> {
     return false;
   }
 
-  LogicalResult rewriteWithSCFWhile(Operation *op, ValueRange operands,
+    LogicalResult rewriteWithSCFWhile(Operation *op, ValueRange operands,
       ConversionPatternRewriter &rewriter) const {
     Location loc = ONNXLoc<ONNXLoopOp>(op);
-    auto loopOp = mlir::dyn_cast<ONNXLoopOp>(op);
+    auto loopOp = mlir::dyn_cast<ONNXLoopOp>(op); //将操作转换为ONNX Loop操作
     MultiDialectBuilder<KrnlBuilder, MemRefBuilder, MathBuilder> create(
-        rewriter, loc);
+        rewriter, loc); //创建一个多方言构建器,用于生成Krnl、MemRef和Math操作
+
+
+
+    // Check if cond is modified in loop body
+    bool condModified = false;
+    if (!isNoneValue(loopOp.getCond())) { //Modified by p
+      // Analyze loop body to check if cond is modified
+      Region &loopBody = loopOp.getBody();
+      Block &loopBodyEntryBlock = loopBody.front();
+      Operation *terminator = loopBodyEntryBlock.getTerminator();
+      // If the first output of loop body (which corresponds to cond) is different
+      // from input cond, then cond is modified
+      if (terminator->getNumOperands() > 0) {
+        Value condOutput = terminator->getOperand(0);
+        Value condInput = loopOp.getOperand(1);
+        auto constOp1 = dyn_cast_or_null<ONNXConstantOp>(condOutput.getDefiningOp());
+        auto constOp2 = dyn_cast_or_null<ONNXConstantOp>(condInput.getDefiningOp());
+        if (constOp1 != constOp2) {
+            condModified = true;
+        }
+        // if (condOutput != condInput) {
+        //     condModified = true;
+        // }
+      }
+    }
+
+
 
     // Create memref object for induction variable and outputs
     // As a result, there is no memref object returned from LoopOp,
     // just the value in these "global" memref objects.
     Value ivMemRef =
         create.mem.alloc(MemRefType::get({}, rewriter.getI64Type()));
-    Value cond = create.mem.alloc(MemRefType::get({}, rewriter.getI1Type()));
+    Value cond;
+        cond = create.mem.alloc(MemRefType::get({}, rewriter.getI1Type())); //为循环变量和条件分配内存
     ONNXLoopOpAdaptor adaptor(operands, op->getAttrDictionary());
 
     // Construct inputs for WhileOp, which should be (0, cond, v_initial)
@@ -548,7 +576,10 @@ struct ONNXLoopOpLowering : public OpConversionPattern<ONNXLoopOp> {
       locs.emplace_back(loc);
     }
 
-    if (!isNoneValue(loopOp.getCond())) {
+
+
+    // Handle cond parameter - only include it if it's modified in loop body
+    if (!isNoneValue(loopOp.getCond())) { // Modified by p
       hasCond = true;
       whileInputValues.emplace_back(adaptor.getCond());
       whileInputTypes.emplace_back(adaptor.getCond().getType());
@@ -589,27 +620,30 @@ struct ONNXLoopOpLowering : public OpConversionPattern<ONNXLoopOp> {
       rewriter.setInsertionPointToStart(&whileOp.getBefore().front());
       Value mCond;
       int argIndex = 0;
-      if (hasM) {
+      if (hasM) { //判断循环上届
         auto iv = beforeBlock->getArgument(argIndex);
         mCond = create.math.slt(iv, ubV);
         argIndex++;
       }
 
-      Value condV;
-      if (hasCond) {
-        condV = create.krnl.load(beforeBlock->getArgument(argIndex));
-      }
+      if(condModified){// modified by p
+        Value condV;
+        if (hasCond) { //判断cond
+          condV = create.krnl.load(beforeBlock->getArgument(argIndex));
+        }
 
-      Value combinedV;
-      if (hasM && hasCond) {
-        combinedV = create.math.andi(mCond, condV);
-      } else if (hasM) {
-        combinedV = mCond;
-      } else {
-        combinedV = condV;
+        Value combinedV;
+        if (hasM && hasCond) {
+          combinedV = create.math.andi(mCond, condV);
+        } else if (hasM) {
+          combinedV = mCond;
+        } else {
+          combinedV = condV;
+        }
+        rewriter.create<scf::ConditionOp>(loc, combinedV, arguments);
       }
-
-      rewriter.create<scf::ConditionOp>(loc, combinedV, arguments);
+      else
+        rewriter.create<scf::ConditionOp>(loc, mCond, arguments);
     }
 
     // Construct the body of while loop
@@ -713,10 +747,12 @@ struct ONNXLoopOpLowering : public OpConversionPattern<ONNXLoopOp> {
       // Copy the newly computed loop condition to pre-allocated buffer.
       // It can be assumed that hasCond
       int condIndex = 0;
-      if (hasCond) {
+      if (condModified && hasCond) { // Modified by p
         emitCopy(rewriter, loc, bodyOutputs[0], cond);
         condIndex++;
       }
+      else if(!condModified && hasCond)
+        condIndex++;
 
       // Copy intermediate values of scan outputs to their corresponding
       // slice in the loop scan output tensor.
@@ -765,7 +801,7 @@ struct ONNXLoopOpLowering : public OpConversionPattern<ONNXLoopOp> {
         Value newIV = create.math.add(afterBlock->getArgument(0), c1);
         yieldList.emplace_back(newIV);
       }
-      if (hasCond) {
+      if (hasCond) { // Modified by p
         yieldList.emplace_back(cond);
       }
       for (auto v : outputs) {

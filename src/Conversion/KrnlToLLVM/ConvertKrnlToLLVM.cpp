@@ -15,6 +15,8 @@
 
 #include <fstream>
 
+#include "mlir/Dialect/GPU/IR/GPUDialect.h" //add by p
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h" //add by p
 #include "mlir/Analysis/DataLayoutAnalysis.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
@@ -870,6 +872,8 @@ void ConvertKrnlToLLVMPass::runOnOperation() {
   // Define the target for this lowering i.e. the LLVM dialect.
   ConversionTarget target(*ctx);
   target.addLegalDialect<LLVM::LLVMDialect>();
+  target.addLegalDialect<gpu::GPUDialect>(); //add by p
+  target.addLegalDialect<NVVM::NVVMDialect>(); // add by p
   target.addLegalOp<ModuleOp>();
   target.addLegalOp<UnrealizedConversionCastOp>();
 
