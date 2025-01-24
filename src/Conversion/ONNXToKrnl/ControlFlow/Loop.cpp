@@ -506,8 +506,8 @@ struct ONNXLoopOpLowering : public OpConversionPattern<ONNXLoopOp> {
     // `ONNXYieldOp (cond, ..., ubValue, ..., newCounterValue, ...)`
     // which means the condition is loop invariant.
     Value breakCond = yieldOp->getOperands()[0];
-    if (mlir::isa<BlockArgument>(breakCond) &&
-        mlir::cast<BlockArgument>(breakCond).getArgNumber() == 1) {
+    if ((mlir::isa<BlockArgument>(breakCond) && 
+          mlir::cast<BlockArgument>(breakCond).getArgNumber() == 1) || breakCond == onnxLoopOp.getOperand(1)) { //modified by p
     } else
       return true;
 
@@ -517,9 +517,9 @@ struct ONNXLoopOpLowering : public OpConversionPattern<ONNXLoopOp> {
     LogicalResult rewriteWithSCFWhile(Operation *op, ValueRange operands,
       ConversionPatternRewriter &rewriter) const {
     Location loc = ONNXLoc<ONNXLoopOp>(op);
-    auto loopOp = mlir::dyn_cast<ONNXLoopOp>(op); //将操作转换为ONNX Loop操作
+    auto loopOp = mlir::dyn_cast<ONNXLoopOp>(op);
     MultiDialectBuilder<KrnlBuilder, MemRefBuilder, MathBuilder> create(
-        rewriter, loc); //创建一个多方言构建器,用于生成Krnl、MemRef和Math操作
+        rewriter, loc);
 
 
 
@@ -554,7 +554,7 @@ struct ONNXLoopOpLowering : public OpConversionPattern<ONNXLoopOp> {
     Value ivMemRef =
         create.mem.alloc(MemRefType::get({}, rewriter.getI64Type()));
     Value cond;
-        cond = create.mem.alloc(MemRefType::get({}, rewriter.getI1Type())); //为循环变量和条件分配内存
+        cond = create.mem.alloc(MemRefType::get({}, rewriter.getI1Type()));
     ONNXLoopOpAdaptor adaptor(operands, op->getAttrDictionary());
 
     // Construct inputs for WhileOp, which should be (0, cond, v_initial)
