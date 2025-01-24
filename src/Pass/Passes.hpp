@@ -26,6 +26,7 @@ class Pass;
 } // namespace mlir
 
 namespace onnx_mlir {
+std::unique_ptr<mlir::Pass> createSimplifyAffineForPass();
 
 /// Pass for removing DisposableElementsAttr attributes.
 std::unique_ptr<mlir::Pass> createScrubDisposablePass(bool closeAfter = true);
