@@ -41,6 +41,10 @@ void registerOMPasses(int optLevel) {
     return krnl::createRemoveRedundantSCFIfPass();
   });
 
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modified by p
+    return krnl::createInsertGPUAllocPass();
+  });
+
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return createScrubDisposablePass();
   });
