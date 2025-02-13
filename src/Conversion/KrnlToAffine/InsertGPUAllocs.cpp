@@ -80,22 +80,54 @@ static Value processOperand(OpBuilder &builder, Operation *launchOp, Location lo
       llvm::report_fatal_error("InsertGPUAllocsPass: 不支持动态维度");
   }
 
+  // if (defOp && (isa<memref::AllocOp>(defOp) ||
+  //               isa<memref::ReinterpretCastOp>(defOp) ||
+  //               defOp->getName().getStringRef() == "krnl.global")) {
+  //   // For reinterpret_cast or krnl.global, a copy is required.
+  //   bool doCopy = isa<memref::ReinterpretCastOp>(defOp) ||
+  //                 (defOp->getName().getStringRef() == "krnl.global");
+  //   // If coming from memref.alloc and no copy is needed, mark that all users need to be updated.
+  //   if (!doCopy && isa<memref::AllocOp>(defOp)) {
+  //     builder.setInsertionPoint(defOp);
+  //     needUpdateUsers = true;
+  //   } 
+  //   else if(defOp->getName().getStringRef() == "krnl.global"){
+  //     builder.setInsertionPoint(defOp);
+  //     needUpdateUsers = false;
+  //   }
+  //   else {
+  //     needUpdateUsers = false;
+  //     builder.setInsertionPoint(launchOp);
+  //   }
+  //   return createGpuAllocAndCopy(builder, loc, operand, dims, doCopy);
+  // }
+
   if (defOp && (isa<memref::AllocOp>(defOp) ||
                 isa<memref::ReinterpretCastOp>(defOp) ||
                 defOp->getName().getStringRef() == "krnl.global")) {
-    // For reinterpret_cast or krnl.global, a copy is required.
-    bool doCopy = isa<memref::ReinterpretCastOp>(defOp) ||
-                  (defOp->getName().getStringRef() == "krnl.global");
-    // If coming from memref.alloc and no copy is needed, mark that all users need to be updated.
-    if (!doCopy && isa<memref::AllocOp>(defOp)) {
+    bool doCopy = false;
+    // For krnl.global, insert the copy at the same location as the original krnl.global op.
+    if (defOp->getName().getStringRef() == "krnl.global") {
+      doCopy = true;
+      builder.setInsertionPointAfter(defOp);
+      needUpdateUsers = false;
+    }
+    // For reinterpret_cast, insert copy within the launch op.
+    else if (isa<memref::ReinterpretCastOp>(defOp)) {
+      doCopy = true;
+      builder.setInsertionPoint(launchOp);
+      needUpdateUsers = false;
+    }
+    // For memref.alloc with no copy required, update users.
+    else if (isa<memref::AllocOp>(defOp)) {
+      doCopy = false;
       builder.setInsertionPoint(defOp);
       needUpdateUsers = true;
-    } else {
-      needUpdateUsers = false;
-      builder.setInsertionPoint(launchOp);
     }
     return createGpuAllocAndCopy(builder, loc, operand, dims, doCopy);
   }
+
+
   // In all other cases, return the original value directly.
   needUpdateUsers = false;
   return operand;
