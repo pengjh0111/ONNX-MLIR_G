@@ -3,6 +3,7 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/OpDefinition.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Pass/Pass.h"
@@ -120,8 +121,15 @@ static Value processOperand(OpBuilder &builder, Operation *launchOp, Location lo
     }
     // For memref.alloc with no copy required, update users.
     else if (isa<memref::AllocOp>(defOp)) {
+      // doCopy = false;
+      // builder.setInsertionPoint(defOp);
+      // needUpdateUsers = true;
       doCopy = false;
-      builder.setInsertionPoint(defOp);
+      auto funcOp = defOp->getParentOfType<func::FuncOp>();
+      if (!funcOp) {
+        llvm::report_fatal_error("memref.alloc op is not within a function");
+      }
+      builder.setInsertionPointToStart(&funcOp.getBody().front());
       needUpdateUsers = true;
     }
     return createGpuAllocAndCopy(builder, loc, operand, dims, doCopy);
