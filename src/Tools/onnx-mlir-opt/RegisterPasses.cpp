@@ -45,6 +45,10 @@ void registerOMPasses(int optLevel) {
     return krnl::createInsertGPUAllocPass();
   });
 
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modified by p
+    return createParallelLoopTilingPass({1}, false);
+  });  
+
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return createScrubDisposablePass();
   });
