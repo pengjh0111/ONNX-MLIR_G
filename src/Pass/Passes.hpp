@@ -104,7 +104,7 @@ std::unique_ptr<mlir::Pass> createLowerToStablehloPass(bool enableUnroll);
 /// Pass for eliding the values of global Krnl operations.
 std::unique_ptr<mlir::Pass> createElideConstGlobalValuePass();
 
-std::unique_ptr<mlir::Pass> createParallelLoopTilingPass(llvm::ArrayRef<int64_t> tileSizes, bool noMinMaxBounds); //modefied by p
+std::unique_ptr<mlir::Pass> createParallelLoopTilingPass(bool noMinMaxBounds); //modefied by p
 
 namespace krnl {
 /// Pass for lowering frontend dialects to Krnl IR dialect.

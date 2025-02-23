@@ -17,7 +17,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
-
+#include <queue>
 namespace mlir {
 #define GEN_PASS_DEF_SCFPARALLELLOOPTILING
 #include "mlir/Dialect/SCF/Transforms/Passes.h.inc"
@@ -25,6 +25,7 @@ namespace mlir {
 
 using namespace mlir;
 using namespace mlir::scf;
+using namespace llvm;
 
 /// Tile a parallel loop of the form
 ///   scf.parallel (%i0, %i1) = (%arg0, %arg1) to (%arg2, %arg3)
@@ -54,6 +55,214 @@ using namespace mlir::scf;
 /// %i0 + j0 and %i1 + %j1.
 ///
 /// The old loop is replaced with the new one.
+namespace {
+struct LoopDim {
+  int length;
+  int max_axis;
+};
+
+struct TilingSolution {
+  SmallVector<int> thread_tiles;
+  SmallVector<int> block_tiles;
+  float score = -1.0f;
+};
+struct TileCandidate {
+  SmallVector<int> tiles;
+  float score;
+  
+  TileCandidate(size_t numDims) : tiles(numDims, 1), score(0.0f) {}
+  
+  bool operator<(const TileCandidate &other) const {
+      return score < other.score;
+  }
+};
+
+constexpr int MAX_THREADS = 1024;
+constexpr int WARP_SIZE = 32;
+constexpr std::array<int, 3> MAX_BLOCK_DIM_ARRAY = {1024, 1024, 64};
+const ArrayRef<int> MAX_BLOCK_DIM(MAX_BLOCK_DIM_ARRAY);
+// const ArrayRef<int> MAX_BLOCK_DIM = {1024, 1024, 64};
+} // namespace
+
+void generateCandidates(int length, int maxTile, SmallVectorImpl<int> &candidates) {
+  candidates.clear();
+  maxTile = std::min(maxTile, length);
+
+  // 生成Warp对齐的候选
+  bool hasCandidate = false;
+  for (int t = (maxTile / WARP_SIZE) * WARP_SIZE; t >= WARP_SIZE; t -= WARP_SIZE)
+    if (length % t == 0) {
+      candidates.push_back(t);
+      hasCandidate = true;
+    }
+
+  // 生成非对齐但可整除的候选
+  if (!hasCandidate) {
+    for (int t = maxTile; t >= 1; --t) {
+        if (length % t == 0) {
+            candidates.push_back(t);
+        }
+    }
+  }
+}
+
+float evaluateSolution(ArrayRef<LoopDim> dims, ArrayRef<int> threadTiles) {
+  int threadProduct = 1;
+  int blockProduct = 1;
+  int warpAlignedCount = 0;
+  
+  for (int i = 0; i < dims.size(); ++i) {
+      threadProduct *= threadTiles[i];
+      blockProduct *= dims[i].length / threadTiles[i];
+      
+      // 奖励Warp对齐的维度
+      if (threadTiles[i] % WARP_SIZE == 0) {
+          warpAlignedCount++;
+      }
+  }
+  
+  float utilization = 1.0f - std::abs(1.0f - float(threadProduct)/MAX_THREADS);
+  float blockScore = std::log(1 + blockProduct) * 2.0f;
+  float alignmentBonus = warpAlignedCount * 0.5f;
+  
+  return utilization * 0.4 + blockScore * 0.5 + alignmentBonus * 0.1;
+}
+
+void optimizeTiling(ArrayRef<LoopDim> dims, TilingSolution &best) {
+  best = TilingSolution{};
+  if (dims.empty()) return;
+
+  const int numDims = dims.size();
+  SmallVector<SmallVector<int>> allCandidates(numDims);
+
+  // 步骤1：为每个维度生成候选（降序排列）
+  // 生成候选时确保非空
+  for (int i = 0; i < numDims; ++i) {
+    generateCandidates(dims[i].length, dims[i].max_axis, allCandidates[i]);
+    assert(!allCandidates[i].empty() && "Candidates should never be empty");
+    std::reverse(allCandidates[i].begin(), allCandidates[i].end());
+  }
+
+  // 步骤2：优先队列用于存储候选方案
+  // 选择每个维度的第一个候选（最大可能值）
+  TileCandidate initial(numDims);
+  for (int i = 0; i < numDims; ++i) {
+    initial.tiles[i] = allCandidates[i].front(); // 取最大候选
+  }
+  
+  // 检查初始候选的有效性
+  int totalThreads = 1;
+  for (int t : initial.tiles) totalThreads *= t;
+  if (totalThreads > MAX_THREADS) {
+    // 如果初始候选无效，回退到全1
+    initial.tiles.assign(numDims, 1);
+  }
+  initial.score = evaluateSolution(dims, initial.tiles);
+  
+  std::priority_queue<TileCandidate> pq;
+  pq.push(initial);
+
+  // 步骤3：分支限界搜索
+  constexpr int MAX_CANDIDATES = 1000;
+  int evaluated = 0;
+  
+  while (!pq.empty() && evaluated++ < MAX_CANDIDATES) {
+      auto current = pq.top();
+      pq.pop();
+
+      // 检查是否完整方案
+      bool isComplete = true;
+      for (int i = 0; i < numDims; ++i) {
+          if (current.tiles[i] == 1) {
+              isComplete = false;
+              break;
+          }
+      }
+
+      if (isComplete) {
+          if (current.score > best.score) {
+              best.thread_tiles = current.tiles;
+              best.score = current.score;
+          }
+          continue;
+      }
+
+      // 生成子候选
+      for (int dim = 0; dim < numDims; ++dim) {
+          if (current.tiles[dim] != 1) continue;
+
+          for (int cand : allCandidates[dim]) {
+              // 检查线程总数约束
+              int total = 1;
+              for (int d = 0; d < numDims; ++d) {
+                  total *= (d == dim) ? cand : current.tiles[d];
+                  if (total > MAX_THREADS) break;
+              }
+              if (total > MAX_THREADS) continue;
+
+              // 创建新候选
+              TileCandidate newCandidate = current;
+              newCandidate.tiles[dim] = cand;
+              newCandidate.score = evaluateSolution(dims, newCandidate.tiles);
+              
+              pq.push(newCandidate);
+          }
+          break; // 每次只扩展一个维度
+      }
+  }
+
+  // 在计算block_tiles前添加回退
+  if (best.thread_tiles.empty()) {
+    best.thread_tiles.resize(numDims);
+    
+    // 第一遍：设置每个维度为最大可能值
+    for (int i = 0; i < numDims; ++i) {
+      best.thread_tiles[i] = std::min(dims[i].length, dims[i].max_axis);
+      best.thread_tiles[i] = std::max(best.thread_tiles[i], 1); // 确保不小于1
+    }
+
+    // 第二遍：调整到满足线程总数限制
+    int total = 1;
+    for (int t : best.thread_tiles) total *= t;
+    
+    while (total > MAX_THREADS && total > 1) {
+      bool reduced = false;
+      // 从最后一个维度开始调整
+      for (int i = numDims-1; i >= 0; --i) {
+        if (best.thread_tiles[i] > 1) {
+          const int original = best.thread_tiles[i];
+          // 寻找下一个更小的候选
+          for (int t : allCandidates[i]) {
+            if (t < original) {
+              best.thread_tiles[i] = t;
+              total = total / original * t;
+              reduced = true;
+              break;
+            }
+          }
+          if (reduced) break;
+        }
+      }
+      
+      // 如果无法进一步调整，直接设为全1
+      if (!reduced) {
+        best.thread_tiles.assign(numDims, 1);
+        break;
+      }
+    }
+    
+    best.score = evaluateSolution(dims, best.thread_tiles);
+  }
+  
+  // 步骤4：计算block_tiles
+  best.block_tiles.resize(numDims);
+  for (int i = 0; i < numDims; ++i) {
+    assert(best.thread_tiles[i] != 0 && "Zero tile size detected");
+    assert(dims[i].length % best.thread_tiles[i] == 0 && "Invalid tile size");
+    best.block_tiles[i] = dims[i].length / best.thread_tiles[i];
+  }
+}
+
 std::pair<ParallelOp, ParallelOp>
 tileParallelLoopPlus(ParallelOp op, llvm::ArrayRef<int64_t> tileSizes,
                             bool noMinMaxBounds) {
@@ -194,29 +403,70 @@ struct ParallelLoopTiling
     : public impl::SCFParallelLoopTilingBase<ParallelLoopTiling> {
 public:
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ParallelLoopTiling)
-  ParallelLoopTiling() = default;
-  explicit ParallelLoopTiling(llvm::ArrayRef<int64_t> tileSizes,
-                              bool noMinMaxBounds = false) {
-    this->tileSizes = tileSizes;
+  explicit ParallelLoopTiling(bool noMinMaxBounds = false) {
     this->noMinMaxBounds = noMinMaxBounds;
   }
 
   void runOnOperation() override {
-    for (auto tileSize : tileSizes)
-      if (tileSize == 0) {
-        mlir::emitError(mlir::UnknownLoc::get(&Pass::getContext()),
-                        "tile size cannot be 0");
-        return signalPassFailure();
-      }
+    // for (auto tileSize : tileSizes)
+    //   if (tileSize == 0) {
+    //     mlir::emitError(mlir::UnknownLoc::get(&Pass::getContext()),
+    //                     "tile size cannot be 0");
+    //     return signalPassFailure();
+    //   }
+    // auto *parentOp = getOperation();
+    // SmallVector<ParallelOp, 2> innermostPloops;
+    // getInnermostParallelLoops(parentOp, innermostPloops);
+    // for (ParallelOp ploop : innermostPloops) {
+    //   // FIXME: Add reduction support.
+    //   if (ploop.getNumReductions() == 0)
+    //     tileParallelLoopPlus(ploop, tileSizes, noMinMaxBounds);
+    // }
     auto *parentOp = getOperation();
-    SmallVector<ParallelOp, 2> innermostPloops;
+    SmallVector<scf::ParallelOp> innermostPloops;
     getInnermostParallelLoops(parentOp, innermostPloops);
-    for (ParallelOp ploop : innermostPloops) {
-      // FIXME: Add reduction support.
-      if (ploop.getNumReductions() == 0)
-        tileParallelLoopPlus(ploop, tileSizes, noMinMaxBounds);
+  
+    for (scf::ParallelOp ploop : innermostPloops) {
+      if (ploop.getNumReductions() != 0) continue;
+  
+      // 收集维度信息
+      SmallVector<LoopDim> loopDims;
+      for (auto [i, bounds] : llvm::enumerate(llvm::zip(
+               ploop.getLowerBound(), ploop.getUpperBound(), ploop.getStep()))) {
+        auto [lower, upper, step] = bounds;
+        auto lowerConst = dyn_cast<arith::ConstantIndexOp>(lower.getDefiningOp());
+        auto upperConst = dyn_cast<arith::ConstantIndexOp>(upper.getDefiningOp());
+        auto stepConst = dyn_cast<arith::ConstantIndexOp>(step.getDefiningOp());
+  
+        if (!lowerConst || !upperConst || !stepConst) {
+          ploop.emitWarning("Dynamic loop bounds not supported");
+          loopDims.clear();
+          break;
+        }
+  
+        int length = (upperConst.value() - lowerConst.value()) / stepConst.value();
+        int maxAxis = i < 3 ? MAX_BLOCK_DIM[i] : 32;
+        loopDims.push_back({length, maxAxis});
+      }
+  
+      if (loopDims.empty()) continue;
+  
+      // 计算最佳分块
+      TilingSolution solution;
+      optimizeTiling(loopDims, solution);
+  
+      // 转换分块方案
+      SmallVector<int64_t> tileSizes;
+      for (int t : solution.thread_tiles)
+        tileSizes.push_back(t);
+  
+      // 应用分块
+      tileParallelLoopPlus(ploop, tileSizes, noMinMaxBounds);
     }
   }
+
+
+  
   StringRef getArgument() const final { return "scf-parallel-loop-tiling-plus"; }
   StringRef getDescription() const final { 
     return "....."; 
@@ -232,8 +482,8 @@ public:
 
 
 namespace onnx_mlir {
-  std::unique_ptr<mlir::Pass> createParallelLoopTilingPass(llvm::ArrayRef<int64_t> tileSizes, bool noMinMaxBounds) {
-    return std::make_unique<ParallelLoopTiling>(tileSizes, noMinMaxBounds);
+  std::unique_ptr<mlir::Pass> createParallelLoopTilingPass(bool noMinMaxBounds) {
+    return std::make_unique<ParallelLoopTiling>(noMinMaxBounds);
   }
 } // namespace onnx_mlir
     
