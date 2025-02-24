@@ -87,23 +87,62 @@ const ArrayRef<int> MAX_BLOCK_DIM(MAX_BLOCK_DIM_ARRAY);
 void generateCandidates(int length, int maxTile, SmallVectorImpl<int> &candidates) {
   candidates.clear();
   maxTile = std::min(maxTile, length);
-
-  // 生成Warp对齐的候选
-  bool hasCandidate = false;
-  for (int t = (maxTile / WARP_SIZE) * WARP_SIZE; t >= WARP_SIZE; t -= WARP_SIZE)
-    if (length % t == 0) {
-      candidates.push_back(t);
-      hasCandidate = true;
+  
+  // 阶段1：生成性能导向的候选值
+  // ------------------------------------------------------------
+  // 策略1：优先生成Warp对齐或接近的候选
+  const int warpSize = 32;
+  // 添加 Warp 的倍数
+  for (int i = 1; i <= 8; i++) {
+    int candidate = warpSize * i;
+    if (candidate <= maxTile) {
+        candidates.push_back(candidate);
+    } else {
+        break;  // 如果已经超过 maxTile，后续的倍数就不用看了
     }
-
-  // 生成非对齐但可整除的候选
-  if (!hasCandidate) {
-    for (int t = maxTile; t >= 1; --t) {
-        if (length % t == 0) {
-            candidates.push_back(t);
-        }
+  } 
+  for (int i = 1; i <= 8; i++) {  // 生成接近 Warp 的值
+    int candidate = warpSize - i;  // 比 Warp 小一点的值
+    if (candidate > 0 && candidate <= maxTile) {
+        candidates.push_back(candidate);
+    }
+    
+    candidate = warpSize + i;  // 比 Warp 大一点的值
+    if (candidate <= maxTile) {
+        candidates.push_back(candidate);
     }
   }
+  
+  // 策略2：生成2的幂次方候选
+  for (int t = 1; t <= maxTile; t *= 2) {
+    if (std::find(candidates.begin(), candidates.end(), t) == candidates.end()) {
+      candidates.push_back(t);
+    }
+  }
+  
+
+  // 策略3：填充密集候选（确保连续覆盖）
+  const int stepSize = std::max(1, maxTile/20); // 按比例采样
+  for (int t = maxTile; t >= 1; t -= stepSize) {
+    candidates.push_back(t);
+  }
+  
+  // 阶段2：排序和去重（按性能潜力降序排列）
+  // ------------------------------------------------------------
+  llvm::sort(candidates, [](int a, int b) {
+    auto getPriority = [](int val) {
+        if (val <= 32) return 3;      // 小尺寸优先
+        if (val % 32 ==0) return 2;
+        if ((val & (val-1)) == 0) return 1; // 2的幂次方
+        return 0;
+    };
+    return getPriority(a) > getPriority(b) || 
+          (getPriority(a) == getPriority(b) && a > b);
+  });
+  
+  // 去重
+  auto last = std::unique(candidates.begin(), candidates.end());
+  candidates.erase(last, candidates.end());
 }
 
 float evaluateSolution(ArrayRef<LoopDim> dims, ArrayRef<int> threadTiles) {
@@ -115,16 +154,21 @@ float evaluateSolution(ArrayRef<LoopDim> dims, ArrayRef<int> threadTiles) {
       threadProduct *= threadTiles[i];
       blockProduct *= dims[i].length / threadTiles[i];
       
-      // 奖励Warp对齐的维度
       if (threadTiles[i] % WARP_SIZE == 0) {
           warpAlignedCount++;
       }
   }
   
+  // 线程利用率：鼓励接近但不超过MAX_THREADS
   float utilization = 1.0f - std::abs(1.0f - float(threadProduct)/MAX_THREADS);
-  float blockScore = std::log(1 + blockProduct) * 2.0f;
+  
+  // Block评分：
+  float blockScore = std::log(1 + blockProduct) / std::log(400);//取分母block数为SM数（A100）的四倍左右
+  
+  // 对齐奖励
   float alignmentBonus = warpAlignedCount * 0.5f;
   
+  // 权重分配
   return utilization * 0.4 + blockScore * 0.5 + alignmentBonus * 0.1;
 }
 
@@ -135,132 +179,88 @@ void optimizeTiling(ArrayRef<LoopDim> dims, TilingSolution &best) {
   const int numDims = dims.size();
   SmallVector<SmallVector<int>> allCandidates(numDims);
 
-  // 步骤1：为每个维度生成候选（降序排列）
-  // 生成候选时确保非空
-  for (int i = 0; i < numDims; ++i) {
+  // 步骤1：生成考虑并行度的候选
+  for (int i = 0; i < numDims; ++i)
     generateCandidates(dims[i].length, dims[i].max_axis, allCandidates[i]);
-    assert(!allCandidates[i].empty() && "Candidates should never be empty");
-    std::reverse(allCandidates[i].begin(), allCandidates[i].end());
-  }
 
-  // 步骤2：优先队列用于存储候选方案
-  // 选择每个维度的第一个候选（最大可能值）
-  TileCandidate initial(numDims);
-  for (int i = 0; i < numDims; ++i) {
-    initial.tiles[i] = allCandidates[i].front(); // 取最大候选
-  }
-  
-  // 检查初始候选的有效性
-  int totalThreads = 1;
-  for (int t : initial.tiles) totalThreads *= t;
-  if (totalThreads > MAX_THREADS) {
-    // 如果初始候选无效，回退到全1
-    initial.tiles.assign(numDims, 1);
-  }
-  initial.score = evaluateSolution(dims, initial.tiles);
-  
-  std::priority_queue<TileCandidate> pq;
-  pq.push(initial);
-
-  // 步骤3：分支限界搜索
-  constexpr int MAX_CANDIDATES = 1000;
-  int evaluated = 0;
-  
-  while (!pq.empty() && evaluated++ < MAX_CANDIDATES) {
-      auto current = pq.top();
-      pq.pop();
-
-      // 检查是否完整方案
-      bool isComplete = true;
-      for (int i = 0; i < numDims; ++i) {
-          if (current.tiles[i] == 1) {
-              isComplete = false;
-              break;
-          }
-      }
-
-      if (isComplete) {
-          if (current.score > best.score) {
-              best.thread_tiles = current.tiles;
-              best.score = current.score;
-          }
-          continue;
-      }
-
-      // 生成子候选
-      for (int dim = 0; dim < numDims; ++dim) {
-          if (current.tiles[dim] != 1) continue;
-
-          for (int cand : allCandidates[dim]) {
-              // 检查线程总数约束
-              int total = 1;
-              for (int d = 0; d < numDims; ++d) {
-                  total *= (d == dim) ? cand : current.tiles[d];
-                  if (total > MAX_THREADS) break;
-              }
-              if (total > MAX_THREADS) continue;
-
-              // 创建新候选
-              TileCandidate newCandidate = current;
-              newCandidate.tiles[dim] = cand;
-              newCandidate.score = evaluateSolution(dims, newCandidate.tiles);
-              
-              pq.push(newCandidate);
-          }
-          break; // 每次只扩展一个维度
-      }
-  }
-
-  // 在计算block_tiles前添加回退
-  if (best.thread_tiles.empty()) {
-    best.thread_tiles.resize(numDims);
-    
-    // 第一遍：设置每个维度为最大可能值
-    for (int i = 0; i < numDims; ++i) {
-      best.thread_tiles[i] = std::min(dims[i].length, dims[i].max_axis);
-      best.thread_tiles[i] = std::max(best.thread_tiles[i], 1); // 确保不小于1
-    }
-
-    // 第二遍：调整到满足线程总数限制
-    int total = 1;
-    for (int t : best.thread_tiles) total *= t;
-    
-    while (total > MAX_THREADS && total > 1) {
-      bool reduced = false;
-      // 从最后一个维度开始调整
-      for (int i = numDims-1; i >= 0; --i) {
-        if (best.thread_tiles[i] > 1) {
-          const int original = best.thread_tiles[i];
-          // 寻找下一个更小的候选
-          for (int t : allCandidates[i]) {
-            if (t < original) {
-              best.thread_tiles[i] = t;
-              total = total / original * t;
-              reduced = true;
-              break;
-            }
-          }
-          if (reduced) break;
+    // 步骤2：初始化
+    TileCandidate initial(numDims);
+    int remainingThreads = MAX_THREADS;// 跟踪剩余可用线程数
+    for (int i = 0; i < numDims; ++i) {// 为每个维度选择不超过剩余线程数的最大候选值
+      for (int cand : allCandidates[i]) {
+        if (cand <= remainingThreads) {
+          initial.tiles[i] = cand;
+          remainingThreads /= cand;
+          break;
         }
       }
-      
-      // 如果无法进一步调整，直接设为全1
-      if (!reduced) {
-        best.thread_tiles.assign(numDims, 1);
-        break;
+    }
+    initial.score = evaluateSolution(dims, initial.tiles);// 计算初始解的得分
+    
+    std::priority_queue<TileCandidate> pq;
+    pq.push(initial);
+
+    // 步骤3：搜索逻辑
+    constexpr int MAX_CANDIDATES = 2000;
+    int evaluated = 0;
+    
+    while (!pq.empty() && evaluated++ < MAX_CANDIDATES) {
+        auto current = pq.top();
+        pq.pop();
+
+        // 更新best
+        if (current.score > best.score){
+          best.thread_tiles.clear();
+          best.thread_tiles.append(current.tiles.begin(), current.tiles.end());
+          best.score = current.score;
+        }
+
+      // 优先扩展能增加并行度的维度
+      for (int dim = 0; dim < numDims; ++dim) {
+        for (int cand : allCandidates[dim]) {
+            if (cand == current.tiles[dim]) continue;
+
+            TileCandidate newCandidate = current;
+            newCandidate.tiles[dim] = cand;
+            
+            // 检查线程总数约束
+            int total = 1;
+            for (int t : newCandidate.tiles) total *= t;
+            if (total > MAX_THREADS) continue;
+
+            newCandidate.score = evaluateSolution(dims, newCandidate.tiles);
+            pq.push(newCandidate);
+        }
       }
     }
-    
-    best.score = evaluateSolution(dims, best.thread_tiles);
-  }
-  
-  // 步骤4：计算block_tiles
-  best.block_tiles.resize(numDims);
-  for (int i = 0; i < numDims; ++i) {
-    assert(best.thread_tiles[i] != 0 && "Zero tile size detected");
-    assert(dims[i].length % best.thread_tiles[i] == 0 && "Invalid tile size");
-    best.block_tiles[i] = dims[i].length / best.thread_tiles[i];
-  }
+
+    // 步骤4：回退策略
+    if (best.thread_tiles.empty()) {
+      best.thread_tiles.resize(numDims, 2);  // 初始化为1
+      
+      bool hasOptimizedDim = false;
+      // 第一层：尝试优化合适的维度
+      for (int i = 0; i < numDims; ++i) {
+          if (dims[i].length >= 32) {
+              best.thread_tiles[i] = 32;
+              hasOptimizedDim = true;
+              break;
+          }
+      }
+      
+      // 如果没有找到合适的32对齐的维度，使用更保守的设置
+      if (!hasOptimizedDim) {
+          for (int i = 0; i < numDims; ++i) {
+              best.thread_tiles[i] = std::min(dims[i].length, 16);
+          }
+      }
+    }
+
+    // 计算最终block tiles
+    best.block_tiles.resize(numDims);
+    for (int i = 0; i < numDims; ++i) {
+        best.block_tiles[i] = (dims[i].length + best.thread_tiles[i] - 1) / best.thread_tiles[i];
+    }
 }
 
 std::pair<ParallelOp, ParallelOp>
