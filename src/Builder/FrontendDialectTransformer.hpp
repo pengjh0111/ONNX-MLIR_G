@@ -40,7 +40,11 @@ namespace onnx_mlir {
  * Options to control the translation of an ONNX model to ONNX-MLIR.
  */
 struct ImportOptions {
-  bool verboseOutput = false;
+
+  int timeSteps = 16; // 模型的时间步数
+  bool enableSkewedScheduling = true; // 是否启用倾斜调度
+  bool verboseOutput = false;  // 用于输出详细信息
+
   // Use types/shapes in the input-model for translation (for intermediate
   // variables)
   bool useOnnxModelTypes = false;

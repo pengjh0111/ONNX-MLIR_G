@@ -163,7 +163,7 @@ float evaluateSolution(ArrayRef<LoopDim> dims, ArrayRef<int> threadTiles) {
   float utilization = 1.0f - std::abs(1.0f - float(threadProduct)/MAX_THREADS);
   
   // Block评分：
-  float blockScore = std::log(1 + blockProduct) / std::log(400);//取分母block数为SM数（A100）的四倍左右
+  float blockScore = std::log(1 + blockProduct) / std::log(1000);//取分母block数为SM数（A100）的四倍左右
   
   // 对齐奖励
   float alignmentBonus = warpAlignedCount * 0.5f;
@@ -186,7 +186,7 @@ void optimizeTiling(ArrayRef<LoopDim> dims, TilingSolution &best) {
     // 步骤2：初始化
     TileCandidate initial(numDims);
     int remainingThreads = MAX_THREADS;// 跟踪剩余可用线程数
-    for (int i = 0; i < numDims; ++i) {// 为每个维度选择不超过剩余线程数的最大候选值
+    for (int i = 0; i < numDims; ++i) {
       for (int cand : allCandidates[i]) {
         if (cand <= remainingThreads) {
           initial.tiles[i] = cand;
@@ -215,7 +215,7 @@ void optimizeTiling(ArrayRef<LoopDim> dims, TilingSolution &best) {
           best.score = current.score;
         }
 
-      // 优先扩展能增加并行度的维度
+      // 
       for (int dim = 0; dim < numDims; ++dim) {
         for (int cand : allCandidates[dim]) {
             if (cand == current.tiles[dim]) continue;
@@ -236,7 +236,7 @@ void optimizeTiling(ArrayRef<LoopDim> dims, TilingSolution &best) {
 
     // 步骤4：回退策略
     if (best.thread_tiles.empty()) {
-      best.thread_tiles.resize(numDims, 2);  // 初始化为1
+      best.thread_tiles.resize(numDims, 1);  // 初始化为1
       
       bool hasOptimizedDim = false;
       // 第一层：尝试优化合适的维度

@@ -157,6 +157,26 @@ public:
       : context_(context), builder_(&context) {
     module_ = ModuleOp::create(UnknownLoc::get(&context));
     InitHandlerMap();
+
+    // 初始化SNN模式
+    // LIF模式1
+    snnPatterns_.push_back({
+      "LIF1",
+      {"Div", "GreaterOrEqual", "Cast", "Mul", "Neg", "Add", "Mul", "Add"}
+    });
+
+    // LIF模式2 
+    snnPatterns_.push_back({
+      "LIF2",
+      {"Sub", "Div", "Add", "GreaterOrEqual", "Cast", "Mul", "Neg", "Add", "Mul", "Add"}
+    });
+
+    // LIF模式3 
+    snnPatterns_.push_back({
+      "LIF3",
+      {"Sub", "Div", "Add", "GreaterOrEqual", "Cast"}
+    });
+    
   }
 
   ModuleOp ImportONNXModel(
@@ -165,20 +185,89 @@ public:
     modelInputShaper_.setShapeInformation(options_.shapeInformation);
     opset_map_ = GetOpsetImportsFromProto(model); // Which opsets to use.
     in_model_functions_ = GetModelLocalFunctions(model);
-    importGraph(model.graph());
+    // importGraph(model.graph());
+    // if (options_.verboseOutput) {
+    //   llvm::outs()
+    //       << "The ONNX model has " << num_of_parameters_
+    //       << " elements in its initializers. This value would be close to and "
+    //          "greater than the number of parameters in the model. Because "
+    //          "there is no way to exactly count the number of parameters, this "
+    //          "value can be used to have a rough idea of the number of "
+    //          "parameters in the model.\n";
+    // }
+    // return module_;
+
+  // 设置时间步数
+  if (options_.timeSteps > 0) {
+    totalTimeSteps_ = options_.timeSteps;
+  }
+  
+  // 重置状态
+  currentLayerIdx_ = 0;
+  isFirstOp_ = true;
+  opInfoMap_.clear();
+  recentOps_.clear();
+  
+  // 导入图
+  importGraph(model.graph());
+  
+  // 如果启用了倾斜调度
+  if (options_.enableSkewedScheduling) {
+    // 识别SNN组件
+    IdentifySNNComponents();
+    
+    // 计算倾斜调度
+    ComputeSkewedScheduling();
+    
+    // 这里先不实现重排序部分
+    // ReorganizeOperations();
+    
     if (options_.verboseOutput) {
-      llvm::outs()
-          << "The ONNX model has " << num_of_parameters_
-          << " elements in its initializers. This value would be close to and "
-             "greater than the number of parameters in the model. Because "
-             "there is no way to exactly count the number of parameters, this "
-             "value can be used to have a rough idea of the number of "
-             "parameters in the model.\n";
+      llvm::outs() << "Applied skewed scheduling: identified " 
+                   << opInfoMap_.size() << " operations.\n";
     }
-    return module_;
+  }
+  
+  return module_;
+
+
+
   }
 
 private:
+
+  // 在FrontendGenImpl类中添加
+  struct OpInfo {
+    int layerIdx;   // 操作层次位置
+    int timeStep;   // 时间步
+    int groupId;    // 并行组ID
+    std::string opType;  // 操作类型
+    bool isFirstNonSnnOp = false; // 是否是第一个非SNN操作
+    std::string snnComponentType;  // SNN组件类型（如"LIF"）
+    int snnComponentIdx = -1;  // SNN组件索引
+  };
+
+  // SNN组件操作序列模式
+  struct SNNPattern {
+    std::string name;  // 组件名称（如"LIF"）
+    std::vector<std::string> opSequence;  // 操作序列
+  };
+
+  // 存储已知的SNN模式
+  std::vector<SNNPattern> snnPatterns_;
+  // 存储操作信息的映射
+  std::unordered_map<std::string, OpInfo> opInfoMap_;
+  // 存储操作名称到操作的映射
+  std::unordered_map<std::string, Operation*> opMap_;
+  // 当前层计数
+  int currentLayerIdx_ = 0;
+  // 总时间步数
+  int totalTimeSteps_ = 1;
+  // 是否是模型中的第一个操作
+  bool isFirstOp_ = true;
+  // 最近导入的操作序列，用于模式匹配
+  std::vector<std::pair<std::string, std::string>> recentOps_; // 存储 <opType, opName>
+
   ImportOptions options_;
   MLIRContext &context_;
   ModuleOp module_;
@@ -445,13 +534,140 @@ private:
       attributes.push_back(convertOnnxAttributeProtoToMlirNamedAttribute(attr));
     }
 
-    // If the node has a name, then import it.
+    // // If the node has a name, then import it.
+    // if (node.has_name()) {
+    //   attributes.push_back(builder_.getNamedAttr(
+    //       "onnx_node_name", builder_.getStringAttr(node.name())));
+    // }
+    // return attributes;
+
+    std::string opType = node.op_type();
+    std::string nodeName;
+    
     if (node.has_name()) {
-      attributes.push_back(builder_.getNamedAttr(
-          "onnx_node_name", builder_.getStringAttr(node.name())));
+      nodeName = node.name();
+    } else {
+      nodeName = opType + "_" + std::to_string(currentLayerIdx_);
     }
+    
+    // 跟踪最近的操作，用于模式匹配
+    recentOps_.push_back({opType, nodeName});
+    
+    // 设置基本操作信息
+    OpInfo info;
+    info.layerIdx = currentLayerIdx_;
+    info.timeStep = 0; // 初始值，后续更新
+    info.opType = opType;
+    info.groupId = -1; // 后续计算
+    opInfoMap_[nodeName] = info;
+    
+    // 为操作添加名称标识符
+    attributes.push_back(builder_.getNamedAttr(
+        "onnx_node_name", builder_.getStringAttr(nodeName)));
+    
+    // 更新计数器
+    currentLayerIdx_++;
+    
     return attributes;
+
   }
+
+  void IdentifySNNComponents() {
+    // 尝试匹配SNN模式
+    int snnComponentCounter = 0;
+    
+    // 从头开始遍历所有操作
+    for (size_t startPos = 0; startPos + 1 < recentOps_.size(); startPos++) {
+      // 对每个SNN模式进行尝试匹配
+      for (const auto &pattern : snnPatterns_) {
+        // 如果剩余操作数量足够匹配模式
+        if (startPos + pattern.opSequence.size() <= recentOps_.size()) {
+          // 尝试匹配模式
+          bool matched = true;
+          for (size_t i = 0; i < pattern.opSequence.size(); i++) {
+            if (recentOps_[startPos + i].first != pattern.opSequence[i]) {
+              matched = false;
+              break;
+            }
+          }
+          
+          // 如果匹配成功
+          if (matched) {
+            // 创建SNN组件ID
+            std::string componentId = pattern.name + "_" + std::to_string(snnComponentCounter);
+            
+            // 为匹配到的操作设置SNN组件信息
+            for (size_t i = 0; i < pattern.opSequence.size(); i++) {
+              std::string opName = recentOps_[startPos + i].second;
+              
+              // 更新操作信息
+              auto it = opInfoMap_.find(opName);
+              if (it != opInfoMap_.end()) {
+                it->second.snnComponentType = pattern.name;
+                it->second.snnComponentIdx = snnComponentCounter;
+              }
+            }
+            
+            // 增加计数器并跳过已匹配的操作
+            snnComponentCounter++;
+            startPos += pattern.opSequence.size() - 1;
+            break;  // 找到匹配后退出当前模式循环
+          }
+        }
+      }
+    }
+  }
+  
+  void ComputeSkewedScheduling() {
+    // 首先，确定哪些操作是模型的第一个非SNN操作
+    if (isFirstOp_) {
+      for (const auto &pair : recentOps_) {
+        auto infoIt = opInfoMap_.find(pair.second);
+        if (infoIt != opInfoMap_.end() && infoIt->second.snnComponentIdx == -1) {
+          infoIt->second.isFirstNonSnnOp = true;
+          break;
+        }
+      }
+    }
+    
+    // 然后，为每个操作分配时间步和计算组ID
+    for (auto &pair : opInfoMap_) {
+      OpInfo &info = pair.second;
+      
+      // 第一个非SNN操作在所有时间步共享（只计算一次）
+      if (info.isFirstNonSnnOp) {
+        info.timeStep = 0;
+      } 
+      // SNN组件操作和其他非SNN操作（不是第一个）在每个时间步执行一次
+      else {
+        // 如果是SNN组件，使用组件索引来确定时间步
+        if (info.snnComponentIdx != -1) {
+          info.timeStep = info.snnComponentIdx % totalTimeSteps_;
+        } 
+        // 其他非SNN操作，根据层索引来确定时间步
+        else {
+          info.timeStep = info.layerIdx % totalTimeSteps_;
+        }
+      }
+      
+      // 使用倾斜公式计算组ID：groupId = layerIdx + timeStep
+      info.groupId = info.layerIdx + info.timeStep;
+      
+      // 更新操作的onnx_node_name属性
+      std::string updatedName = pair.first + "(group" + std::to_string(info.groupId) + ")";
+      
+      // 查找对应的操作并更新其属性
+      for (Operation &op : module_.getOps()) {
+        if (auto attr = op.getAttrOfType<StringAttr>("onnx_node_name")) {
+          if (attr.getValue().str() == pair.first) {
+            op.setAttr("onnx_node_name", builder_.getStringAttr(updatedName));
+            break;
+          }
+        }
+      }
+    }
+  }
+  
 
   // Generate a string vector from the dimParams option string
   void getInputDimParamsMapFromOption(std::string optionStr,
@@ -489,15 +705,15 @@ private:
    */
   FunctionType importGraph(const onnx::GraphProto &graph, Region &region,
       Operation *op, bool useReturn) {
-    frontend_symbols_.pushScope(graph.name());
+    frontend_symbols_.pushScope(graph.name()); // 为当前图建立新的命名作用域，保证在解析图时名称不会冲突。
     onnx_type_map.pushScope(graph.name());
-    Block *entryBlock = &region.back();
+    Block *entryBlock = &region.back(); // 获取 region 中最后一个块（一般为入口块），后续将在此块中插入参数和操作。
 
     // Maintain a mapping between the parameter and its initializer.
     std::unordered_set<std::string> initializerNames;
-    for (const auto &initializer : graph.initializer()) {
-      BindOnnxName(initializer.name(), ImportTensor(initializer));
-      initializerNames.insert(initializer.name());
+    for (const auto &initializer : graph.initializer()) { // 遍历图中所有的 initializer（常量或预初始化张量）。
+      BindOnnxName(initializer.name(), ImportTensor(initializer)); // 调用 ImportTensor 将 initializer 转换为内部张量表示，然后用 BindOnnxName 将其绑定到对应的名称。
+      initializerNames.insert(initializer.name()); // 同时记录所有 initializer 的名称，存入 initializerNames 集合中。
     }
 
     // create a function for the graph
@@ -513,62 +729,62 @@ private:
     //
     // See https://github.com/onnx/onnx/blob/main/docs/IR.md for more
     // information about dim_param.
-    llvm::SmallVector<std::string, 4> inputDimParams, outputDimParams;
+    llvm::SmallVector<std::string, 4> inputDimParams, outputDimParams; // 初始化保存函数参数类型 (argTypes)、输入/输出名称以及动态维度参数（dim_params）的容器。
     std::map<int, std::string> inputDimParamsFromOption;
     std::string inputDimParamsFromOptionForAllArgs;
     getInputDimParamsMapFromOption(options_.dimParams, inputDimParamsFromOption,
-        inputDimParamsFromOptionForAllArgs);
+        inputDimParamsFromOptionForAllArgs); // 将编译器选项中设置的维度参数映射提取出来，便于后续处理输入张量的动态维度信息。
 
     // Import the input tensor types that are not constant and not initialized.
     int inputIndex = 0;
-    for (const auto &input : graph.input()) {
+    for (const auto &input : graph.input()) { // 遍历图中所有输入张量，调用 AddValueInfo 将输入的元数据加入内部数据结构中。
       AddValueInfo(input);
-      if (initializerNames.count(input.name()) == 0) {
-        inputNames.push_back(input.name());
+      if (initializerNames.count(input.name()) == 0) { // 对于那些名称不在 initializerNames 集合中的输入（即未初始化的输入）
+        inputNames.push_back(input.name()); // 将其名称存入 inputNames
         std::string dimParams = "";
-        Type argTy = ImportType(input.type(), &dimParams);
-        argTy = modelInputShaper_.reshape(inputIndex, argTy);
+        Type argTy = ImportType(input.type(), &dimParams); // 调用 ImportType 将 ONNX 类型转换为内部类型，同时获取动态维度参数字符串 dimParams
+        argTy = modelInputShaper_.reshape(inputIndex, argTy); // 使用 modelInputShaper_ 对输入类型进行形状调整
         // For each input tensor, use either all dimensions by the compiler
         // option OR all dimensions in the original onnx model. Dimensions
         // from the option and the model in a single input tensor are not
         // merged.
         if (inputDimParamsFromOption.find(inputIndex) !=
             inputDimParamsFromOption.end())
-          inputDimParams.emplace_back(inputDimParamsFromOption[inputIndex]);
+          inputDimParams.emplace_back(inputDimParamsFromOption[inputIndex]); // 根据编译器选项和原始 dimParams 设置输入的动态维度参数，并存入 inputDimParams
         else if (!inputDimParamsFromOptionForAllArgs.empty())
           inputDimParams.emplace_back(inputDimParamsFromOptionForAllArgs);
         else if (!dimParams.empty())
           inputDimParams.emplace_back(dimParams);
 
-        argTypes.emplace_back(argTy);
+        argTypes.emplace_back(argTy); // 最后将转换后的类型 argTy 添加到函数参数类型列表 argTypes 中
 
         // numInputs is the number of graph inputs not contained within the
         // initializer
-        ++inputIndex;
+        ++inputIndex; // inputIndex 用于跟踪非初始化输入的个数和对应位置
       }
     }
 
     // The compiler assumes the model is correct and doesn't try to do
     // exhaustive correctness checking of its own
-    for (const auto &internal : graph.value_info()) {
+    for (const auto &internal : graph.value_info()) { // 遍历图中保存的中间值（内部节点输出）的信息，并调用 AddValueInfo（带上标志 true 表示为中间值）保存到内部数据结构中
       AddValueInfo(internal, true);
     }
 
-    for (const auto &output : graph.output()) {
+    for (const auto &output : graph.output()) { // 遍历图中所有的输出张量，同样调用 AddValueInfo 保存输出的元信息
       // Output tensor may be in input list
       AddValueInfo(output, true);
-      outputNames.push_back(output.name());
+      outputNames.push_back(output.name()); // 将输出张量名称存入 outputNames，便于后续设置属性
     }
 
     entryBlock->addArguments(argTypes,
-        llvm::SmallVector<Location, 4>(argTypes.size(), UnknownLoc()));
+        llvm::SmallVector<Location, 4>(argTypes.size(), UnknownLoc())); // 为入口块添加参数，参数类型由之前构建的 argTypes 列表提供。每个参数都分配一个位置，并使用 UnknownLoc() 表示未知的源代码位置。
 
     // Map graph inputs to entry block arguments.
     // Counter of un-initialized tensors. This counter is used to index the
     // entry block arguments.
     int entryBlockArgIdx = 0;
     for (const auto &input : graph.input()) {
-      if (initializerNames.count(input.name()) == 0) {
+      if (initializerNames.count(input.name()) == 0) { // 遍历所有输入张量，对于那些不是 initializer 的输入，将其名称与入口块中的对应参数进行绑定。
         BindOnnxName(
             input.name(), entryBlock->getArguments()[entryBlockArgIdx]);
         entryBlockArgIdx++;
@@ -576,26 +792,27 @@ private:
     }
 
     // Import nodes in the subgraph.
-    for (const auto &item : graph.node()) {
+    for (const auto &item : graph.node()) { // 遍历图中所有节点，每个节点调用 ImportNode 进行转换，将 ONNX 节点转换为内部中间表示（IR）的操作
       ImportNode(item);
     }
 
-    llvm::SmallVector<Type, 4> retTys;
+    llvm::SmallVector<Type, 4> retTys; // 初始化保存返回类型 retTys 与返回值 retVals 的容器。
     llvm::SmallVector<Value, 4> retVals;
     // Import the output tensors
-    for (const auto &output : graph.output()) {
+    for (const auto &output : graph.output()) { // 遍历每个输出张量，调用 ImportOutputTensor 将输出张量转换为内部表示，同时更新返回类型和返回值
       std::string dimParams = "";
       ImportOutputTensor(output, retTys, retVals, &dimParams);
-      if (!dimParams.empty())
+      if (!dimParams.empty()) // 同时获取输出张量的动态维度参数，并保存到 outputDimParams 中
         outputDimParams.emplace_back(dimParams);
     }
 
-    if (useReturn)
-      builder_.create<ONNXReturnOp>(UnknownLoc(), retVals);
+    if (useReturn) // 根据标志 useReturn 来决定使用哪种返回操作
+      builder_.create<ONNXReturnOp>(UnknownLoc(), retVals); // 若为真，则创建 ONNXReturnOp，直接返回输出值
     else
       // Create a return operation to return all ONNX output tensors.
-      builder_.create<ONNXYieldOp>(UnknownLoc(), retVals);
+      builder_.create<ONNXYieldOp>(UnknownLoc(), retVals); // 否则，创建 ONNXYieldOp，可能用于协程或生成器等场景，返回输出值
 
+    // 设置输入/输出维度参数属性
     SmallVector<llvm::StringRef> inputDimParamsRefs, outputDimParamsRefs;
     for (uint64_t i = 0; i < inputDimParams.size(); ++i)
       inputDimParamsRefs.emplace_back(llvm::StringRef(inputDimParams[i]));
@@ -612,9 +829,9 @@ private:
       op->setAttr(
           "output_dim_params", builder_.getStrArrayAttr(outputDimParamsRefs));
 
-    frontend_symbols_.popScope(graph.name());
+    frontend_symbols_.popScope(graph.name()); // 离开先前建立的符号和类型作用域，确保作用域管理正确
     onnx_type_map.popScope(graph.name());
-    return builder_.getFunctionType(argTypes, retTys);
+    return builder_.getFunctionType(argTypes, retTys); // 最后调用 builder_.getFunctionType 构造并返回当前函数的类型，函数类型由输入参数类型（argTypes）和返回类型（retTys）组成
   }
 
   void ImportNodeGeneric(const onnx::NodeProto &node) {
@@ -751,9 +968,9 @@ private:
   void buildOutputAndOperation(const onnx::NodeProto &node,
       std::vector<Value> inputs, int expectedNumOperands,
       int expectedNumResults, const std::vector<NamedAttribute> &attributes,
-      std::vector<Type> givenOutputTypes = std::vector<Type>()) {
-    bool variadicIn = expectedNumOperands == -1;
-    bool variadicOut = expectedNumResults == -1;
+      std::vector<Type> givenOutputTypes = std::vector<Type>()) { // 根据输入、输出、属性等信息，将其转换成 MLIR 的 Operation 并插入到当前 MLIR 模块 中
+    bool variadicIn = expectedNumOperands == -1; // 表示是否是可变输入数量
+    bool variadicOut = expectedNumResults == -1; // 表示是否是可变输出数量
 
     // In ONNX, there are two ways to leave an optional input or output
     // unspecified: the first, available only for trailing inputs and outputs,
@@ -763,23 +980,23 @@ private:
     // Here, we import optional inputs and outputs as NoneType.
 
     // Trailing optional inputs.
-    if (!variadicIn)
+    if (!variadicIn) // 对于非可变输入，如果当前输入数量不足 expectedNumOperands，则使用 NoneType 填充
       for (int i = (int)inputs.size(); i < expectedNumOperands; i++) {
         inputs.emplace_back(createNoneValue());
       }
 
-    std::vector<Type> outputTypes;
+    std::vector<Type> outputTypes; // 存储转换后 MLIR 的输出类型
 
     // Use the type map or types in input model to determine the data type of
     // output.
-    std::vector<int> outputMap = T::getTypeMap();
-    for (unsigned int i = 0; i < (unsigned int)node.output().size(); i++) {
+    std::vector<int> outputMap = T::getTypeMap(); //  通过 T::getTypeMap() 获取 ONNX 到 MLIR 类型映射表
+    for (unsigned int i = 0; i < (unsigned int)node.output().size(); i++) { // 遍历每个 ONNX 输出
       // Optional outputs using empty string.
-      if (node.output()[i].empty()) {
+      if (node.output()[i].empty()) { // 输出为空字符串：表示该输出是可选的，使用 NoneType
         outputTypes.emplace_back(builder_.getNoneType());
-      } else if (auto onnxModelType = ConvertOnnxType(node.output(i))) {
+      } else if (auto onnxModelType = ConvertOnnxType(node.output(i))) { // 通过ConvertOnnxType转换类型：若能从 ONNX 中推断类型，直接使用
         outputTypes.emplace_back(onnxModelType.value());
-      } else {
+      } else { // 变长输出：j = 0，表示多个输出共用一个 Type
         unsigned int j = i;
         // Variadic output is a single ODS result.
         if (variadicOut)
@@ -814,9 +1031,9 @@ private:
         outputTypes.emplace_back(builder_.getNoneType());
 
     // TODO: Handle optional inputs.
-    T op = builder_.create<T>(ImportLoc(node), outputTypes, inputs, attributes);
+    T op = builder_.create<T>(ImportLoc(node), outputTypes, inputs, attributes); // 使用 OpBuilder 创建 MLIR 运算符 T
     // Type inference for results.
-    for (const auto &attr : node.attribute()) {
+    for (const auto &attr : node.attribute()) { // 对于 包含子图 的 ONNX 运算符（如 If、Loop），递归调用 importGraph()
       if (attr.type() == onnx::AttributeProto_AttributeType_GRAPH) {
         OperationName opName = op->getName();
         assert(opName.hasInterface<HasOnnxSubgraphOpInterface>() &&
@@ -839,7 +1056,7 @@ private:
       }
     }
     if (auto opWithTypeInference =
-            mlir::dyn_cast<ResultTypeInferenceOpInterface>(op.getOperation())) {
+            mlir::dyn_cast<ResultTypeInferenceOpInterface>(op.getOperation())) { // 如果 T 支持 类型推断接口，则根据输出类型推断结果进行更新
       auto outTypes = opWithTypeInference.resultTypeInference();
       for (int i = 0; i < node.output().size(); i++) {
         OpResult result = op->getResult(i);
@@ -848,7 +1065,7 @@ private:
       }
     }
 
-    for (const auto &[i, output] : llvm::enumerate(node.output())) {
+    for (const auto &[i, output] : llvm::enumerate(node.output())) { // 将 ONNX 输出节点映射到 MLIR Value
       // Skip the output with empty name, which is used as a placeholder
       // in multiple outputs.
       // Found in models. Not sure about the specification.
@@ -1515,6 +1732,7 @@ private:
 }; // class FrontendGenImpl
 
 } // namespace detail
+
 
 bool ImportFrontendModelInternal(onnx::ModelProto &model, MLIRContext &context,
     OwningOpRef<ModuleOp> &module, ImportOptions options) {

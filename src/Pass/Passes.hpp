@@ -25,7 +25,11 @@ class MLIRContext;
 class Pass;
 } // namespace mlir
 
+
 namespace onnx_mlir {
+
+enum FusionMode { Greedy, ProducerConsumer, Sibling }; // add by p
+
 std::unique_ptr<mlir::Pass> createSimplifyAffineForPass();
 
 /// Pass for removing DisposableElementsAttr attributes.
@@ -106,6 +110,11 @@ std::unique_ptr<mlir::Pass> createElideConstGlobalValuePass();
 
 std::unique_ptr<mlir::Pass> createParallelLoopTilingPass(bool noMinMaxBounds); //modefied by p
 
+// std::unique_ptr<mlir::Pass> createLoopFusionPass(unsigned fastMemorySpace,
+//     uint64_t localBufSizeThreshold,
+//     bool maximalFusion,
+//     enum FusionMode fusionMode); //modefied by p
+
 namespace krnl {
 /// Pass for lowering frontend dialects to Krnl IR dialect.
 std::unique_ptr<mlir::Pass> createConvertKrnlToAffinePass();
@@ -124,6 +133,7 @@ std::unique_ptr<mlir::Pass> createConvertKrnlToLLVMPass(bool verifyInputTensors,
     std::string outputNameNoExt, bool enableParallel);
 std::unique_ptr<mlir::Pass> createRemoveRedundantSCFIfPass(); //modefied by p
 std::unique_ptr<mlir::Pass> createInsertGPUAllocPass(); //modefied by p
+std::unique_ptr<mlir::Pass> createKernelParallelizationPass(); //modefied by p
 } // namespace krnl
 
 /// Pass for lowering Onnx ops to TOSA dialect

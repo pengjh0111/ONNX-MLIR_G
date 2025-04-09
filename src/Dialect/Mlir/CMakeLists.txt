@@ -7,6 +7,10 @@ add_onnx_mlir_library(OMMlirDialects
   DialectBuilder.cpp
   VectorMachineSupport.cpp
   ParallelLoopTiling.cpp
+  DependencyGraph.cpp
+  IrReorganization.cpp
+  KernelParallelizationPass.cpp
+  TopoLogicalSort.cpp
 
   DEPENDS
   OMKrnlIncGen

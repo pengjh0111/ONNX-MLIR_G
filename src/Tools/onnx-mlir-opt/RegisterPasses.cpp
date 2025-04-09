@@ -46,8 +46,19 @@ void registerOMPasses(int optLevel) {
   });
 
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modified by p
+    return krnl::createKernelParallelizationPass();
+  });
+
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modified by p
     return createParallelLoopTilingPass(false);
-  });  
+  });
+
+  // mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modified by p
+  //   return createLoopFusionPass(0,
+  //     0,
+  //     false,
+  //     FusionMode::Greedy);
+  // });  
 
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return createScrubDisposablePass();
