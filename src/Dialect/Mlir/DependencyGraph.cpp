@@ -38,19 +38,19 @@ bool isLoopNest(Operation* op) {
   return isa<scf::ForOp>(op) && !op->getParentOfType<scf::ForOp>();
 }
 
-// 辅助函数：查找GPU函数定义
+// Helper function: Find GPU function definition
 gpu::GPUFuncOp findKernelFunc(gpu::LaunchFuncOp kernelOp) {
-  // 获取顶层模块
+  // Get top-level module
   ModuleOp topModule = kernelOp->getParentOfType<ModuleOp>();
   if (!topModule) {
     return nullptr;
   }
 
-  // 获取kernel模块和函数名
+  // Get kernel module and function name
   StringRef kernelModuleName = kernelOp.getKernelModuleName();
   StringRef kernelName = kernelOp.getKernelName();
   
-  // 先尝试找到gpu.module
+  // First try to find the gpu.module
   gpu::GPUModuleOp gpuModule = nullptr;
   topModule.walk([&](gpu::GPUModuleOp module) {
     if (module.getName() == kernelModuleName) {
@@ -60,7 +60,7 @@ gpu::GPUFuncOp findKernelFunc(gpu::LaunchFuncOp kernelOp) {
     return WalkResult::advance();
   });
   
-  // 如果找到GPU模块，在其中搜索kernel函数
+  // If GPU module is found, search for kernel function within it
   if (gpuModule) {
     gpu::GPUFuncOp kernelFunc = nullptr;
     gpuModule.walk([&](gpu::GPUFuncOp func) {
@@ -75,7 +75,7 @@ gpu::GPUFuncOp findKernelFunc(gpu::LaunchFuncOp kernelOp) {
       return kernelFunc;
   }
   
-  // 回退：在整个顶层模块中搜索
+  // Fallback: Search throughout the entire top-level module
   gpu::GPUFuncOp result = nullptr;
   topModule.walk([&](gpu::GPUFuncOp func) {
     if (func.getName() == kernelName) {
@@ -102,15 +102,15 @@ gpu::GPUFuncOp findKernelFunc(gpu::LaunchFuncOp kernelOp) {
 //     }
 //   }
 // }
-// 从内核启动中提取memref输入和输出，分析内核函数定义
+// Extract memref inputs and outputs from a kernel launch, analyze kernel function definition
 void extractKernelDependencies(gpu::LaunchFuncOp kernelOp, 
                               llvm::SetVector<Value> &inputs,
                               llvm::SetVector<Value> &outputs) {
-  // 查找kernel函数定义
+  // Find kernel function definition
   gpu::GPUFuncOp kernelFunc = findKernelFunc(kernelOp);
   
   if (!kernelFunc) {
-    // 如果找不到函数，回退到保守分析
+    // If function not found, fall back to conservative analysis
     llvm::errs() << "Warning: Could not find kernel function definition for \"" 
                 << kernelOp.getKernelName() << "\", using conservative dependency analysis\n";
     for (auto arg : kernelOp.getKernelOperands()) {
@@ -124,10 +124,9 @@ void extractKernelDependencies(gpu::LaunchFuncOp kernelOp,
 
   // llvm::errs() << "Found kernel function definition for \"" << kernelOp.getKernelName() << "\"\n";
   
-  // 映射函数参数到对应的launch操作数（改进版）
   llvm::SmallVector<std::pair<BlockArgument, Value>, 8> argOperandPairs;
   
-  // 统计MemRef类型的参数和操作数数量
+  // Count the number of MemRef type parameters and operands
   unsigned memrefArgCount = 0;
   for (unsigned i = 0; i < kernelFunc.getNumArguments(); ++i) {
     if (kernelFunc.getArgument(i).getType().isa<MemRefType>()) {
@@ -144,20 +143,20 @@ void extractKernelDependencies(gpu::LaunchFuncOp kernelOp,
     }
   }
   
-  // 调试信息
+  // Debug information
   // llvm::errs() << "  MemRef arguments: " << memrefArgCount << ", MemRef operands: " << memrefOpCount << "\n";
   
-  // 遍历所有MemRef类型的函数参数
+  // Traverse all MemRef type function parameters
   unsigned opIdx = 0;
   for (unsigned i = 0; i < kernelFunc.getNumArguments(); ++i) {
     BlockArgument arg = kernelFunc.getArgument(i);
     if (arg.getType().isa<MemRefType>()) {
-      // 确保操作数索引在有效范围内
+      // Ensure operand index is within valid range
       if (opIdx < memrefOperands.size()) {
         Value operand = memrefOperands[opIdx++];
         argOperandPairs.push_back({arg, operand});
         
-        // 调试输出
+        // Debug output
         // llvm::errs() << "  Mapped arg " << i << " to operand:\n    ";
         // arg.print(llvm::errs());
         // llvm::errs() << " -> ";
@@ -167,33 +166,33 @@ void extractKernelDependencies(gpu::LaunchFuncOp kernelOp,
     }
   }
   
-  // 跟踪哪些参数用于load和store
+  // Track which parameters are used for load and store
   llvm::DenseSet<BlockArgument> loadArgs;
   llvm::DenseSet<BlockArgument> storeArgs;
   
-  // 分析kernel函数体中的内存操作
+  // Analyze memory operations in kernel function body
   unsigned loadCount = 0, storeCount = 0;
   kernelFunc.walk([&](Operation *op) {
     if (auto loadOp = dyn_cast<memref::LoadOp>(op)) {
-      // 检查被加载的memref是否为函数参数
+      // Check if the loaded memref is a function parameter
       Value memref = loadOp.getMemref();
       if (auto blockArg = dyn_cast<BlockArgument>(memref)) {
         if (blockArg.getOwner() == &kernelFunc.getBody().front()) {
           loadArgs.insert(blockArg);
           loadCount++;
-          // 调试信息
+          // Debug information
           // llvm::errs() << "  Found load from arg " << blockArg.getArgNumber() << "\n";
         }
       }
     } 
     else if (auto storeOp = dyn_cast<memref::StoreOp>(op)) {
-      // 检查被存储的memref是否为函数参数
+      // Check if the stored memref is a function parameter
       Value memref = storeOp.getMemref();
       if (auto blockArg = dyn_cast<BlockArgument>(memref)) {
         if (blockArg.getOwner() == &kernelFunc.getBody().front()) {
           storeArgs.insert(blockArg);
           storeCount++;
-          // 调试信息
+          // Debug information
           // llvm::errs() << "  Found store to arg " << blockArg.getArgNumber() << "\n";
         }
       }
@@ -202,7 +201,7 @@ void extractKernelDependencies(gpu::LaunchFuncOp kernelOp,
   
   // llvm::errs() << "  Found " << loadCount << " loads and " << storeCount << " stores in kernel\n";
   
-  // 将函数参数分析映射到kernel操作数
+  // Map function parameter analysis to kernel operands
   for (auto &pair : argOperandPairs) {
     BlockArgument arg = pair.first;
     Value operand = pair.second;
@@ -221,7 +220,7 @@ void extractKernelDependencies(gpu::LaunchFuncOp kernelOp,
       outputs.insert(operand);
     }
     
-    // 如果参数既没有被加载也没有被存储，保守起见当作输入
+    // If the parameter is neither loaded nor stored, treat it as input to be conservative
     if (!isInput && !isOutput) {
       inputs.insert(operand);
       llvm::errs() << "  Conservative: treating unused arg " << arg.getArgNumber() << " as input\n";
@@ -252,11 +251,11 @@ void extractLoopDependencies(scf::ForOp loopOp,
   });
 }
 
-// 打印依赖图的文本表示
+// Print text representation of the dependency graph
 void dumpDependencyGraph(DependencyGraph &graph) {
   llvm::errs() << "===== Dependency Graph =====\n";
   
-  // 打印所有节点
+  // Print all nodes
   llvm::errs() << "Nodes (" << graph.nodes.size() << " total):\n";
   for (unsigned i = 0; i < graph.nodes.size(); ++i) {
     DependencyNode* node = graph.nodes[i].get();
@@ -271,7 +270,7 @@ void dumpDependencyGraph(DependencyGraph &graph) {
     }
     llvm::errs() << "\n";
     
-    // 打印输入依赖
+    // Print input dependencies
     llvm::errs() << "    Inputs (" << node->inputs.size() << "):\n";
     for (Value input : node->inputs) {
       llvm::errs() << "      ";
@@ -279,7 +278,7 @@ void dumpDependencyGraph(DependencyGraph &graph) {
       llvm::errs() << "\n";
     }
     
-    // 打印输出依赖
+    // Print output dependencies
     llvm::errs() << "    Outputs (" << node->outputs.size() << "):\n";
     for (Value output : node->outputs) {
       llvm::errs() << "      ";
@@ -287,7 +286,7 @@ void dumpDependencyGraph(DependencyGraph &graph) {
       llvm::errs() << "\n";
     }
     
-    // 打印拓扑排序级别（如果已计算）
+    // Print topological sort level (if calculated)
     if (node->topologicalLevel > 0) {
       llvm::errs() << "    Topological Level: " << node->topologicalLevel << "\n";
     }
@@ -295,24 +294,24 @@ void dumpDependencyGraph(DependencyGraph &graph) {
     llvm::errs() << "\n";
   }
   
-  // 打印所有边
+  // Print all edges
   llvm::errs() << "Edges:\n";
   for (unsigned i = 0; i < graph.nodes.size(); ++i) {
     DependencyNode* node = graph.nodes[i].get();
     
-    // 获取此节点的出边
+    // Get outgoing edges for this node
     if (graph.outEdges.count(node)) {
       const auto &edges = graph.outEdges[node];
       if (!edges.empty()) {
         llvm::errs() << "  From [" << i << "] to:\n";
         
         for (DependencyNode* target : edges) {
-          // 查找目标节点的索引
+          // Find target node index
           for (unsigned j = 0; j < graph.nodes.size(); ++j) {
             if (graph.nodes[j].get() == target) {
               llvm::errs() << "    [" << j << "]";
               
-              // 输出导致此依赖的共享内存引用
+              // Output shared memory references causing this dependency
               bool foundSharedMem = false;
               for (Value out : node->outputs) {
                 for (Value in : target->inputs) {

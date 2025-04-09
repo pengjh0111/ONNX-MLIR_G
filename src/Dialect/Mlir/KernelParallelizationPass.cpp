@@ -32,36 +32,36 @@ struct KernelParallelizationPass
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
     
-    // 步骤 1-2: 为每个函数构建依赖图
+    // Steps 1-2: Build dependency graph for each function
     llvm::SmallVector<std::unique_ptr<DependencyGraph>, 4> functionGraphs;
     
     for (auto funcOp : moduleOp.getOps<func::FuncOp>()) {
         LLVM_DEBUG(llvm::dbgs() << "Processing function: " << funcOp.getName() << "\n");
         
-        // 构建依赖图
+        // Build dependency graph
         auto graph = buildDependencyGraph(funcOp);
-        // dumpDependencyGraph(*graph); // 打印依赖图
+        // dumpDependencyGraph(*graph); // Print dependency graph
         LLVM_DEBUG(llvm::dbgs() << "Built dependency graph with " 
                 << graph->nodes.size() << " nodes\n");
         
-        // 执行拓扑排序
+        // Perform topological sort
         performTopologicalSort(*graph);
         LLVM_DEBUG(dumpTopologicalLevels(*graph));
         
-        // 基于拓扑级别重组IR
+        // Reorganize IR based on topological levels
         reorganizeIR(funcOp, *graph);
         LLVM_DEBUG(llvm::dbgs() << "Reorganized IR for function: " << funcOp.getName() << "\n");
         
-        // 保存图以便模块重组
+        // Save graph for module reorganization
         functionGraphs.push_back(std::move(graph));
     }
     
-    // 步骤 3: 组合所有函数图进行模块重组
+    // Step 3: Combine all function graphs for module reorganization
     auto combinedGraph = std::make_unique<DependencyGraph>();
     for (auto &graph : functionGraphs) {
         for (auto &nodePair : graph->nodes) {
         if (nodePair->type == NodeType::Kernel) {
-            // 仅需保留用于模块重组的内核节点
+            // Only need to keep kernel nodes for module reorganization
             combinedGraph->addNode(std::move(nodePair));
         }
         }

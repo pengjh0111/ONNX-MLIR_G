@@ -1,4 +1,3 @@
-// IrReorganization.cpp 修改
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
@@ -15,66 +14,78 @@ using namespace mlir;
 
 namespace onnx_mlir {
 
-// 修复版的 reorganizeIR 函数
+// Fixed version of reorganizeIR function
 void reorganizeIR(func::FuncOp funcOp, DependencyGraph &graph) {
   OpBuilder builder(funcOp.getContext());
   
-  // 创建映射来跟踪操作映射关系
+  // Create mapping to track operation mapping relationships
   IRMapping mapper;
   
-  // 按拓扑级别对节点分组
+  // Group nodes by topological level
   std::map<unsigned, llvm::SmallVector<DependencyNode*, 8>> nodesByLevel;
   for (const auto &nodePair : graph.nodes) {
     DependencyNode* node = nodePair.get();
     nodesByLevel[node->topologicalLevel].push_back(node);
   }
   
-  // 创建新块
+  // Create new block
   Block* oldBlock = &funcOp.getBody().front();
   Block* newBlock = new Block();
   
-  // 映射参数
+  // Map arguments
   for (auto &blockArg : oldBlock->getArguments()) {
     auto newArg = newBlock->addArgument(blockArg.getType(), blockArg.getLoc());
     mapper.map(blockArg, newArg);
   }
   
-  // 跟踪已处理的操作
+  // Track processed operations
   llvm::DenseSet<Operation*> processedOps;
   
-  // 第一阶段：先复制非图节点的前置操作，但跳过gpu.wait操作
+  // Collect all alloca operations, which need to be placed before use
+  llvm::SmallVector<Operation*, 16> allocaOps;
+  funcOp.walk([&](memref::AllocaOp allocaOp) {
+    allocaOps.push_back(allocaOp);
+  });
+  
+  // Phase 1: First copy non-graph node prefix operations, while handling all allocas
   for (auto &op : oldBlock->getOperations()) {
     if (graph.opToNodeMap.count(&op)) {
-      // 遇到图中节点，停止复制前置操作
+      // Stop copying prefix operations when encountering a node in the graph
       break;
     }
     
-    // 跳过所有GPU等待操作，因为我们会按照依赖图添加必要的等待点
+    // Skip all GPU wait operations, as we will add necessary wait points according to the dependency graph
     if (isa<gpu::WaitOp>(op)) {
       processedOps.insert(&op);
       continue;
     }
     
+    // Record all alloca operations, to be processed together later
+    if (isa<memref::AllocaOp>(op)) {
+      processedOps.insert(&op);
+      continue; // Skip for now, process later
+    }
+    
     Operation *newOp = op.clone(mapper);
     newBlock->push_back(newOp);
     
-    // 更新映射并标记为已处理
+    // Update mapping and mark as processed
     for (unsigned i = 0; i < op.getNumResults(); ++i) {
       mapper.map(op.getResult(i), newOp->getResult(i));
     }
     processedOps.insert(&op);
   }
   
-  // 找到最大拓扑级别
+  // Find maximum topological level
   unsigned maxLevel = 0;
   for (const auto &nodePair : graph.nodes) {
     maxLevel = std::max(maxLevel, nodePair.get()->topologicalLevel);
   }
   
-  // 用于跟踪最后一级别的令牌
+  // For tracking tokens from the final level
   llvm::SmallVector<Value, 8> finalLevelTokens;
   
-  // 第二阶段：按拓扑级别处理节点
+  // Phase 2: Process nodes by topological level
   for (unsigned level = 1; level <= maxLevel; level++) {
     auto levelIt = nodesByLevel.find(level);
     if (levelIt == nodesByLevel.end() || levelIt->second.empty())
@@ -82,29 +93,54 @@ void reorganizeIR(func::FuncOp funcOp, DependencyGraph &graph) {
       
     auto &nodesAtLevel = levelIt->second;
     
-    // 收集本级别的异步令牌
+    // Collect async tokens for this level
     llvm::SmallVector<Value, 8> levelTokens;
     
-    // 处理当前级别的所有节点
+    // Count kernels at current level
+    unsigned kernelCount = 0;
+    for (auto node : nodesAtLevel) {
+      if (node->type == NodeType::Kernel) {
+        kernelCount++;
+      }
+    }
+    
+    // Step 1: Create async wait tokens for all kernels
+    llvm::SmallVector<Value, 8> waitTokens;
+    if (kernelCount > 0) {
+      builder.setInsertionPointToEnd(newBlock);
+      
+      for (unsigned i = 0; i < kernelCount; i++) {
+        // Create async wait operation
+        auto waitOp = builder.create<gpu::WaitOp>(
+            funcOp.getLoc(),
+            builder.getType<gpu::AsyncTokenType>(),
+            ValueRange{});
+        waitTokens.push_back(waitOp.getAsyncToken());
+      }
+    }
+    
+    // Step 2: Process all nodes at the current level
+    unsigned kernelIndex = 0;  // Used to track which kernel is currently being processed
+    
     for (auto node : nodesAtLevel) {
       builder.setInsertionPointToEnd(newBlock);
       
       if (node->type == NodeType::Kernel) {
         auto kernelOp = cast<gpu::LaunchFuncOp>(node->op);
         
-        // 创建内核符号引用
+        // Create kernel symbol reference
         auto kernelSymbol = SymbolRefAttr::get(
             builder.getContext(),
             kernelOp.getKernelModuleName(),
             {SymbolRefAttr::get(builder.getContext(), kernelOp.getKernelName())});
         
-        // 映射操作数
+        // Map operands
         SmallVector<Value, 8> remappedOperands;
         for (Value operand : kernelOp.getKernelOperands()) {
           remappedOperands.push_back(mapper.lookupOrDefault(operand));
         }
         
-        // 映射grid和block尺寸
+        // Map grid and block sizes
         auto gridSize = kernelOp.getGridSizeOperandValues();
         auto blockSize = kernelOp.getBlockSizeOperandValues();
         
@@ -120,80 +156,124 @@ void reorganizeIR(func::FuncOp funcOp, DependencyGraph &graph) {
           mapper.lookupOrDefault(blockSize.z)
         };
         
-        // 创建异步等待操作
-        auto waitOp = builder.create<gpu::WaitOp>(
-            funcOp.getLoc(),
-            builder.getType<gpu::AsyncTokenType>(),
-            ValueRange{});
+        // Use previously created async wait token
+        Value waitToken = waitTokens[kernelIndex++];
             
-        // 直接创建异步内核启动
+        // Directly create async kernel launch
         auto newLaunchOp = builder.create<gpu::LaunchFuncOp>(
             kernelOp.getLoc(),
             kernelSymbol,
             mappedGridSize,
             mappedBlockSize,
-            Value(),  // 没有动态共享内存
+            Value(),  // No dynamic shared memory
             remappedOperands,
-            builder.getType<gpu::AsyncTokenType>(),  // 异步令牌类型
-            ValueRange{waitOp.getAsyncToken()},  // 使用前面创建的异步等待令牌
-            std::nullopt);  // 没有集群大小
+            builder.getType<gpu::AsyncTokenType>(),  // Async token type
+            ValueRange{waitToken},  // Use previously created async wait token
+            std::nullopt);  // No cluster size
             
-        // 收集本级别的异步令牌
+        // Collect async tokens for this level
         levelTokens.push_back(newLaunchOp.getAsyncToken());
             
-        // 映射结果
+        // Map results
         if (kernelOp->getNumResults() > 0) {
           mapper.map(kernelOp->getResult(0), newLaunchOp->getResult(0));
         }
         
-        // 标记为已处理
+        // Mark as processed
         processedOps.insert(node->op);
       } 
       else if (node->type == NodeType::Loop) {
-        // 克隆循环操作
+        // Find all memref.alloca operations associated with this loop
+        llvm::SmallVector<Operation*, 8> loopLocalAllocas;
+        for (auto allocaOp : allocaOps) {
+          // Check if this alloca is used by this loop
+          bool used = false;
+          Value allocaResult = allocaOp->getResult(0);
+          node->op->walk([&](Operation *user) {
+            for (Value operand : user->getOperands()) {
+              if (operand == allocaResult) {
+                used = true;
+                return WalkResult::interrupt();
+              }
+            }
+            return WalkResult::advance();
+          });
+          
+          if (used) {
+            loopLocalAllocas.push_back(allocaOp);
+            processedOps.insert(allocaOp); // Mark as processed
+          }
+        }
+        
+        // Recreate all local allocas before this loop
+        for (auto allocaOp : loopLocalAllocas) {
+          auto newAllocaOp = builder.clone(*allocaOp, mapper);
+          
+          // Update mapping
+          for (unsigned i = 0; i < allocaOp->getNumResults(); ++i) {
+            mapper.map(allocaOp->getResult(i), newAllocaOp->getResult(i));
+          }
+        }
+        
+        // Clone loop operation
         Operation *newOp = builder.clone(*node->op, mapper);
         
-        // 更新映射
+        // Update mapping
         for (unsigned i = 0; i < node->op->getNumResults(); ++i) {
           mapper.map(node->op->getResult(i), newOp->getResult(i));
         }
         
-        // 标记为已处理
+        // Mark as processed
         processedOps.insert(node->op);
       }
     }
     
-    // 如果当前级别有操作
+    // If current level has operations
     if (!levelTokens.empty()) {
-      // 如果不是最后一级，添加一个同步点
+      // If not the last level, add a synchronization point
       if (level < maxLevel) {
         builder.setInsertionPointToEnd(newBlock);
         
-        // 非异步等待 - 确保本级别所有操作完成后才进入下一级别
+        // Non-async wait - ensure all operations at this level complete before moving to the next level
         builder.create<gpu::WaitOp>(funcOp.getLoc(), TypeRange{}, levelTokens);
       } 
-      // 如果是最后一级，保存令牌以便在函数返回前添加最终同步点
+      // If it's the last level, save tokens to add a final sync point before function return
       else {
         finalLevelTokens = levelTokens;
       }
     }
   }
   
-  // 第三阶段：复制剩余未处理的操作，但跳过gpu.wait操作
+  // Process remaining unused alloca operations
+  for (auto allocaOp : allocaOps) {
+    if (!processedOps.count(allocaOp)) {
+      builder.setInsertionPointToEnd(newBlock);
+      auto newAllocaOp = builder.clone(*allocaOp, mapper);
+      
+      // Update mapping
+      for (unsigned i = 0; i < allocaOp->getNumResults(); ++i) {
+        mapper.map(allocaOp->getResult(i), newAllocaOp->getResult(i));
+      }
+      
+      processedOps.insert(allocaOp);
+    }
+  }
+  
+  // Phase 3: Copy remaining unprocessed operations, but skip gpu.wait operations
   bool hasReturnOp = false;
   Operation* returnOp = nullptr;
   
   for (auto &op : oldBlock->getOperations()) {
     if (processedOps.count(&op))
-      continue;  // 跳过已处理的操作
+      continue;  // Skip already processed operations
       
-    // 跳过所有GPU等待操作
+    // Skip all GPU wait operations
     if (isa<gpu::WaitOp>(op)) {
       processedOps.insert(&op);
       continue;
     }
     
-    // 如果是返回操作，先不克隆，稍后处理
+    // If it's a return operation, don't clone it yet, process it later
     if (isa<func::ReturnOp>(op)) {
       hasReturnOp = true;
       returnOp = &op;
@@ -203,32 +283,32 @@ void reorganizeIR(func::FuncOp funcOp, DependencyGraph &graph) {
     Operation *newOp = op.clone(mapper);
     newBlock->push_back(newOp);
     
-    // 更新映射
+    // Update mapping
     for (unsigned i = 0; i < op.getNumResults(); ++i) {
       mapper.map(op.getResult(i), newOp->getResult(i));
     }
   }
   
-  // 如果有最终级别的令牌，添加最终同步点
+  // If there are tokens from the final level, add a final sync point
   if (!finalLevelTokens.empty()) {
     builder.setInsertionPointToEnd(newBlock);
     
-    // 添加最终的同步等待
+    // Add final synchronization wait
     builder.create<gpu::WaitOp>(funcOp.getLoc(), TypeRange{}, finalLevelTokens);
   }
   
-  // 如果有返回操作，现在克隆它
+  // If there's a return operation, clone it now
   if (hasReturnOp) {
     builder.setInsertionPointToEnd(newBlock);
     Operation *newReturnOp = returnOp->clone(mapper);
     newBlock->push_back(newReturnOp);
   }
   
-  // 替换旧块
-  // 1. 添加新块到函数体
+  // Replace old block
+  // 1. Add new block to function body
   funcOp.getBody().push_back(newBlock);
   
-  // 2. 更新使用关系
+  // 2. Update usage relationships
   for (auto &op : oldBlock->getOperations()) {
     for (unsigned i = 0; i < op.getNumResults(); ++i) {
       Value oldResult = op.getResult(i);
@@ -238,16 +318,16 @@ void reorganizeIR(func::FuncOp funcOp, DependencyGraph &graph) {
     }
   }
   
-  // 3. 移除旧块
+  // 3. Remove old block
   oldBlock->dropAllUses();
   oldBlock->erase();
 }
 
-// 修复版的 reorganizeGPUModules 函数
+// Fixed version of reorganizeGPUModules function
 // void reorganizeGPUModules(ModuleOp moduleOp, DependencyGraph &graph) {
 //   OpBuilder builder(moduleOp.getContext());
   
-//   // 按拓扑级别分组模块
+//   // Group modules by topological level
 //   std::map<unsigned, llvm::SmallVector<StringRef, 8>> modulesByLevel;
 //   std::set<std::pair<unsigned, StringRef>> processedModules;
   
@@ -257,7 +337,7 @@ void reorganizeIR(func::FuncOp funcOp, DependencyGraph &graph) {
 //       auto level = node->topologicalLevel;
 //       auto moduleName = node->kernelModuleName;
       
-//       // 每个级别中每个模块只添加一次
+//       // Add each module only once per level
 //       auto key = std::make_pair(level, moduleName);
 //       if (processedModules.insert(key).second) {
 //         modulesByLevel[level].push_back(moduleName);
@@ -265,22 +345,22 @@ void reorganizeIR(func::FuncOp funcOp, DependencyGraph &graph) {
 //     }
 //   }
   
-//   // 记录原始模块和函数名，用于后续更新
+//   // Record original module and function names for later updates
 //   struct ModuleInfo {
 //     llvm::SmallVector<Operation*, 4> toRemove;
 //     llvm::SmallVector<std::pair<gpu::GPUFuncOp, std::string>, 4> funcRenameMap;
 //   };
   
-//   // 为每个级别创建组合模块
+//   // Create combined modules for each level
 //   for (const auto &levelPair : modulesByLevel) {
 //     unsigned level = levelPair.first;
 //     const auto &modules = levelPair.second;
     
-//     // 如果该级别只有一个模块则跳过
+//     // Skip if this level has only one module
 //     if (modules.size() <= 1)
 //       continue;
       
-//     // 创建新的组合模块
+//     // Create new combined module
 //     std::string combinedName = "main_graph_kernel_level_" + std::to_string(level);
 //     builder.setInsertionPointToStart(moduleOp.getBody());
     
@@ -288,63 +368,63 @@ void reorganizeIR(func::FuncOp funcOp, DependencyGraph &graph) {
 //         moduleOp.getLoc(), 
 //         builder.getStringAttr(combinedName));
     
-//     // 添加该级别所有模块中的内核函数到组合模块
+//     // Add kernel functions from all modules at this level to the combined module
 //     builder.setInsertionPointToStart(combinedModule.getBody());
     
 //     ModuleInfo info;
-//     int funcCounter = 0;  // 简单计数器
+//     int funcCounter = 0;  // Simple counter
     
-//     // 第一阶段：克隆所有函数并收集重命名信息
+//     // Phase 1: Clone all functions and collect renaming information
 //     for (auto moduleName : modules) {
 //       bool found = false;
       
-//       // 查找模块
+//       // Find the module
 //       moduleOp.walk([&](gpu::GPUModuleOp op) {
 //         if (op.getName() == moduleName) {
 //           found = true;
           
-//           // 遍历模块中的所有函数
+//           // Walk through all functions in the module
 //           for (Operation &op : op.getBody()->getOperations()) {
 //             if (auto funcOp = dyn_cast<gpu::GPUFuncOp>(op)) {
-//               // 为函数创建新名称
+//               // Create new name for the function
 //               std::string newFuncName = "func_" + std::to_string(funcCounter++);
               
-//               // 克隆并重命名函数
+//               // Clone and rename function
 //               auto clonedFunc = cast<gpu::GPUFuncOp>(builder.clone(op));
 //               clonedFunc.setName(newFuncName);
               
-//               // 记录重命名信息
+//               // Record renaming information
 //               info.funcRenameMap.push_back({cast<gpu::GPUFuncOp>(op), newFuncName});
 //             }
 //           }
           
-//           // 标记模块准备删除
+//           // Mark module for deletion
 //           info.toRemove.push_back(op);
 //         }
 //       });
 //     }
     
-//     // 第二阶段：更新所有内核启动
+//     // Phase 2: Update all kernel launches
 //     moduleOp.walk([&](gpu::LaunchFuncOp op) {
 //       StringRef opModuleName = op.getKernelModuleName();
 //       StringRef opKernelName = op.getKernelName();
       
-//       // 检查此启动是否使用当前级别的任何模块
+//       // Check if this launch uses any module at the current level
 //       for (auto moduleName : modules) {
 //         if (opModuleName == moduleName) {
-//           // 查找对应的重命名信息
+//           // Find the corresponding renaming information
 //           for (auto &pair : info.funcRenameMap) {
 //             gpu::GPUFuncOp origFunc = pair.first;
 //             std::string newFuncName = pair.second;
             
 //             if (origFunc.getName() == opKernelName) {
-//               // 创建新的符号引用
+//               // Create new symbol reference
 //               auto newKernel = SymbolRefAttr::get(
 //                   builder.getContext(),
 //                   StringAttr::get(builder.getContext(), combinedName),
 //                   {SymbolRefAttr::get(builder.getContext(), newFuncName)});
               
-//               // 更新kernel属性
+//               // Update kernel attribute
 //               op->setAttr("kernel", newKernel);
 //               break;
 //             }
@@ -354,7 +434,7 @@ void reorganizeIR(func::FuncOp funcOp, DependencyGraph &graph) {
 //       }
 //     });
     
-//     // 第三阶段：删除原始模块
+//     // Phase 3: Delete original modules
 //     for (Operation *op : info.toRemove) {
 //       op->erase();
 //     }
@@ -364,21 +444,21 @@ void reorganizeIR(func::FuncOp funcOp, DependencyGraph &graph) {
 void reorganizeGPUModules(ModuleOp moduleOp, DependencyGraph &graph) {
   OpBuilder builder(moduleOp.getContext());
   
-  // 直接计数器 - 确保生成唯一名称
+  // Direct counter - ensure unique names are generated
   int moduleCounter = 0;
   int funcCounter = 0;
   
-  // 扫描一次并获取所有模块
+  // Scan once and get all modules
   llvm::SmallVector<gpu::GPUModuleOp, 4> allModules;
   moduleOp.walk([&](gpu::GPUModuleOp op) {
     allModules.push_back(op);
   });
   
-  // 没有模块则退出
+  // Exit if no modules
   if (allModules.empty())
     return;
   
-  // 创建一个新的合并模块
+  // Create a new merged module
   std::string combinedName = "merged_module_" + std::to_string(moduleCounter++);
   builder.setInsertionPointToStart(moduleOp.getBody());
   
@@ -388,10 +468,10 @@ void reorganizeGPUModules(ModuleOp moduleOp, DependencyGraph &graph) {
   
   builder.setInsertionPointToStart(combinedModule.getBody());
   
-  // 创建映射: <旧模块名, 旧函数名> -> 新函数名
+  // Create mapping: <old module name, old function name> -> new function name
   std::map<std::pair<std::string, std::string>, std::string> renameMap;
   
-  // 第一步：复制所有函数并重命名
+  // Step 1: Copy all functions and rename them
   for (auto moduleOp : allModules) {
     std::string oldModuleName = moduleOp.getName().str();
     
@@ -399,20 +479,20 @@ void reorganizeGPUModules(ModuleOp moduleOp, DependencyGraph &graph) {
       if (auto funcOp = dyn_cast<gpu::GPUFuncOp>(op)) {
         std::string oldFuncName = funcOp.getName().str();
         
-        // 创建新函数名
+        // Create new function name
         std::string newFuncName = "kernel_" + std::to_string(funcCounter++);
         
-        // 克隆并重命名函数
+        // Clone and rename function
         auto clonedFunc = cast<gpu::GPUFuncOp>(builder.clone(op));
         clonedFunc.setName(newFuncName);
         
-        // 保存重命名映射
+        // Save renaming mapping
         renameMap[{oldModuleName, oldFuncName}] = newFuncName;
       }
     }
   }
   
-  // 第二步：更新所有kernel启动引用
+  // Step 2: Update all kernel launch references
   moduleOp.walk([&](gpu::LaunchFuncOp op) {
     std::string oldModuleName = op.getKernelModuleName().str();
     std::string oldFuncName = op.getKernelName().str();
@@ -421,18 +501,18 @@ void reorganizeGPUModules(ModuleOp moduleOp, DependencyGraph &graph) {
     if (it != renameMap.end()) {
       std::string newFuncName = it->second;
       
-      // 创建新符号引用
+      // Create new symbol reference
       auto newKernel = SymbolRefAttr::get(
           builder.getContext(),
           StringAttr::get(builder.getContext(), combinedName),
           {SymbolRefAttr::get(builder.getContext(), newFuncName)});
       
-      // 更新属性
+      // Update attribute
       op->setAttr("kernel", newKernel);
     }
   });
   
-  // 第三步：删除旧模块
+  // Step 3: Delete old modules
   for (auto moduleOp : allModules) {
     moduleOp.erase();
   }
