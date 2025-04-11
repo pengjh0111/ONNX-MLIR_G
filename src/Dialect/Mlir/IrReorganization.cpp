@@ -323,171 +323,167 @@ void reorganizeIR(func::FuncOp funcOp, DependencyGraph &graph) {
   oldBlock->erase();
 }
 
-// Fixed version of reorganizeGPUModules function
+// Single_gpu_module version
 // void reorganizeGPUModules(ModuleOp moduleOp, DependencyGraph &graph) {
 //   OpBuilder builder(moduleOp.getContext());
   
-//   // Group modules by topological level
-//   std::map<unsigned, llvm::SmallVector<StringRef, 8>> modulesByLevel;
-//   std::set<std::pair<unsigned, StringRef>> processedModules;
+//   // Direct counter - ensure unique names are generated
+//   int moduleCounter = 0;
+//   int funcCounter = 0;
   
-//   for (const auto &nodePair : graph.nodes) {
-//     DependencyNode* node = nodePair.get();
-//     if (node->type == NodeType::Kernel) {
-//       auto level = node->topologicalLevel;
-//       auto moduleName = node->kernelModuleName;
-      
-//       // Add each module only once per level
-//       auto key = std::make_pair(level, moduleName);
-//       if (processedModules.insert(key).second) {
-//         modulesByLevel[level].push_back(moduleName);
+//   // Scan once and get all modules
+//   llvm::SmallVector<gpu::GPUModuleOp, 4> allModules;
+//   moduleOp.walk([&](gpu::GPUModuleOp op) {
+//     allModules.push_back(op);
+//   });
+  
+//   // Exit if no modules
+//   if (allModules.empty())
+//     return;
+  
+//   // Create a new merged module
+//   std::string combinedName = "merged_module_" + std::to_string(moduleCounter++);
+//   builder.setInsertionPointToStart(moduleOp.getBody());
+  
+//   auto combinedModule = builder.create<gpu::GPUModuleOp>(
+//       moduleOp.getLoc(),
+//       builder.getStringAttr(combinedName));
+  
+//   builder.setInsertionPointToStart(combinedModule.getBody());
+  
+//   // Create mapping: <old module name, old function name> -> new function name
+//   std::map<std::pair<std::string, std::string>, std::string> renameMap;
+  
+//   // Step 1: Copy all functions and rename them
+//   for (auto moduleOp : allModules) {
+//     std::string oldModuleName = moduleOp.getName().str();
+    
+//     for (Operation &op : moduleOp.getBody()->getOperations()) {
+//       if (auto funcOp = dyn_cast<gpu::GPUFuncOp>(op)) {
+//         std::string oldFuncName = funcOp.getName().str();
+        
+//         // Create new function name
+//         std::string newFuncName = "kernel_" + std::to_string(funcCounter++);
+        
+//         // Clone and rename function
+//         auto clonedFunc = cast<gpu::GPUFuncOp>(builder.clone(op));
+//         clonedFunc.setName(newFuncName);
+        
+//         // Save renaming mapping
+//         renameMap[{oldModuleName, oldFuncName}] = newFuncName;
 //       }
 //     }
 //   }
   
-//   // Record original module and function names for later updates
-//   struct ModuleInfo {
-//     llvm::SmallVector<Operation*, 4> toRemove;
-//     llvm::SmallVector<std::pair<gpu::GPUFuncOp, std::string>, 4> funcRenameMap;
-//   };
+//   // Step 2: Update all kernel launch references
+//   moduleOp.walk([&](gpu::LaunchFuncOp op) {
+//     std::string oldModuleName = op.getKernelModuleName().str();
+//     std::string oldFuncName = op.getKernelName().str();
+    
+//     auto it = renameMap.find({oldModuleName, oldFuncName});
+//     if (it != renameMap.end()) {
+//       std::string newFuncName = it->second;
+      
+//       // Create new symbol reference
+//       auto newKernel = SymbolRefAttr::get(
+//           builder.getContext(),
+//           StringAttr::get(builder.getContext(), combinedName),
+//           {SymbolRefAttr::get(builder.getContext(), newFuncName)});
+      
+//       // Update attribute
+//       op->setAttr("kernel", newKernel);
+//     }
+//   });
   
-//   // Create combined modules for each level
-//   for (const auto &levelPair : modulesByLevel) {
-//     unsigned level = levelPair.first;
-//     const auto &modules = levelPair.second;
-    
-//     // Skip if this level has only one module
-//     if (modules.size() <= 1)
-//       continue;
-      
-//     // Create new combined module
-//     std::string combinedName = "main_graph_kernel_level_" + std::to_string(level);
-//     builder.setInsertionPointToStart(moduleOp.getBody());
-    
-//     auto combinedModule = builder.create<gpu::GPUModuleOp>(
-//         moduleOp.getLoc(), 
-//         builder.getStringAttr(combinedName));
-    
-//     // Add kernel functions from all modules at this level to the combined module
-//     builder.setInsertionPointToStart(combinedModule.getBody());
-    
-//     ModuleInfo info;
-//     int funcCounter = 0;  // Simple counter
-    
-//     // Phase 1: Clone all functions and collect renaming information
-//     for (auto moduleName : modules) {
-//       bool found = false;
-      
-//       // Find the module
-//       moduleOp.walk([&](gpu::GPUModuleOp op) {
-//         if (op.getName() == moduleName) {
-//           found = true;
-          
-//           // Walk through all functions in the module
-//           for (Operation &op : op.getBody()->getOperations()) {
-//             if (auto funcOp = dyn_cast<gpu::GPUFuncOp>(op)) {
-//               // Create new name for the function
-//               std::string newFuncName = "func_" + std::to_string(funcCounter++);
-              
-//               // Clone and rename function
-//               auto clonedFunc = cast<gpu::GPUFuncOp>(builder.clone(op));
-//               clonedFunc.setName(newFuncName);
-              
-//               // Record renaming information
-//               info.funcRenameMap.push_back({cast<gpu::GPUFuncOp>(op), newFuncName});
-//             }
-//           }
-          
-//           // Mark module for deletion
-//           info.toRemove.push_back(op);
-//         }
-//       });
-//     }
-    
-//     // Phase 2: Update all kernel launches
-//     moduleOp.walk([&](gpu::LaunchFuncOp op) {
-//       StringRef opModuleName = op.getKernelModuleName();
-//       StringRef opKernelName = op.getKernelName();
-      
-//       // Check if this launch uses any module at the current level
-//       for (auto moduleName : modules) {
-//         if (opModuleName == moduleName) {
-//           // Find the corresponding renaming information
-//           for (auto &pair : info.funcRenameMap) {
-//             gpu::GPUFuncOp origFunc = pair.first;
-//             std::string newFuncName = pair.second;
-            
-//             if (origFunc.getName() == opKernelName) {
-//               // Create new symbol reference
-//               auto newKernel = SymbolRefAttr::get(
-//                   builder.getContext(),
-//                   StringAttr::get(builder.getContext(), combinedName),
-//                   {SymbolRefAttr::get(builder.getContext(), newFuncName)});
-              
-//               // Update kernel attribute
-//               op->setAttr("kernel", newKernel);
-//               break;
-//             }
-//           }
-//           break;
-//         }
-//       }
-//     });
-    
-//     // Phase 3: Delete original modules
-//     for (Operation *op : info.toRemove) {
-//       op->erase();
-//     }
+//   // Step 3: Delete old modules
+//   for (auto moduleOp : allModules) {
+//     moduleOp.erase();
 //   }
 // }
 
+// multi_gpu_module version
 void reorganizeGPUModules(ModuleOp moduleOp, DependencyGraph &graph) {
   OpBuilder builder(moduleOp.getContext());
   
-  // Direct counter - ensure unique names are generated
-  int moduleCounter = 0;
-  int funcCounter = 0;
-  
-  // Scan once and get all modules
+  // Scan all existing modules and functions
   llvm::SmallVector<gpu::GPUModuleOp, 4> allModules;
+  std::map<std::pair<std::string, std::string>, gpu::GPUFuncOp> funcMap;
+  
   moduleOp.walk([&](gpu::GPUModuleOp op) {
     allModules.push_back(op);
+    
+    // Collect all functions in this module
+    std::string moduleName = op.getName().str();
+    op.walk([&](gpu::GPUFuncOp funcOp) {
+      std::string funcName = funcOp.getName().str();
+      funcMap[{moduleName, funcName}] = funcOp;
+    });
   });
   
   // Exit if no modules
   if (allModules.empty())
     return;
   
-  // Create a new merged module
-  std::string combinedName = "merged_module_" + std::to_string(moduleCounter++);
-  builder.setInsertionPointToStart(moduleOp.getBody());
+  // Group kernel nodes by topological level
+  std::map<unsigned, llvm::SmallVector<DependencyNode*, 8>> kernelsByLevel;
+  for (const auto &nodePair : graph.nodes) {
+    DependencyNode* node = nodePair.get();
+    if (node->type == NodeType::Kernel) {
+      kernelsByLevel[node->topologicalLevel].push_back(node);
+    }
+  }
   
-  auto combinedModule = builder.create<gpu::GPUModuleOp>(
-      moduleOp.getLoc(),
-      builder.getStringAttr(combinedName));
+  // Create renaming map: <old module name, old function name> -> <new module name, new function name>
+  using ModuleFuncKey = std::pair<std::string, std::string>;
+  std::map<ModuleFuncKey, ModuleFuncKey> renameMap;
   
-  builder.setInsertionPointToStart(combinedModule.getBody());
+  // Create a counter for each topological level to ensure function name uniqueness
+  std::map<unsigned, int> levelFuncCounter;
   
-  // Create mapping: <old module name, old function name> -> new function name
-  std::map<std::pair<std::string, std::string>, std::string> renameMap;
-  
-  // Step 1: Copy all functions and rename them
-  for (auto moduleOp : allModules) {
-    std::string oldModuleName = moduleOp.getName().str();
+  // Step 1: Create a module for each topological level and copy corresponding functions
+  for (const auto &levelPair : kernelsByLevel) {
+    unsigned level = levelPair.first;
+    const auto &kernels = levelPair.second;
     
-    for (Operation &op : moduleOp.getBody()->getOperations()) {
-      if (auto funcOp = dyn_cast<gpu::GPUFuncOp>(op)) {
-        std::string oldFuncName = funcOp.getName().str();
+    // Skip empty levels
+    if (kernels.empty())
+      continue;
+    
+    // Initialize function counter for this level
+    levelFuncCounter[level] = 0;
+    
+    // Create a new module for this level
+    std::string newModuleName = "level_" + std::to_string(level) + "_module";
+    builder.setInsertionPointToStart(moduleOp.getBody());
+    
+    auto levelModule = builder.create<gpu::GPUModuleOp>(
+        moduleOp.getLoc(),
+        builder.getStringAttr(newModuleName));
+    
+    builder.setInsertionPointToStart(levelModule.getBody());
+    
+    // Copy all kernel functions for this level
+    for (DependencyNode* kernel : kernels) {
+      std::string oldModuleName = kernel->kernelModuleName.str();
+      std::string oldFuncName = kernel->kernelName.str();
+      
+      // Find the original function
+      auto funcKey = std::make_pair(oldModuleName, oldFuncName);
+      auto funcIt = funcMap.find(funcKey);
+      
+      if (funcIt != funcMap.end()) {
+        // Create a new unique function name
+        std::string newFuncName = "kernel_" + std::to_string(level) + "_" + 
+                                  std::to_string(levelFuncCounter[level]++);
         
-        // Create new function name
-        std::string newFuncName = "kernel_" + std::to_string(funcCounter++);
+        // Clone the function to the new module
+        auto clonedFunc = cast<gpu::GPUFuncOp>(builder.clone(*funcIt->second));
         
-        // Clone and rename function
-        auto clonedFunc = cast<gpu::GPUFuncOp>(builder.clone(op));
+        // Set the new function name
         clonedFunc.setName(newFuncName);
         
-        // Save renaming mapping
-        renameMap[{oldModuleName, oldFuncName}] = newFuncName;
+        // Save mapping relationship
+        renameMap[funcKey] = {newModuleName, newFuncName};
       }
     }
   }
@@ -497,17 +493,20 @@ void reorganizeGPUModules(ModuleOp moduleOp, DependencyGraph &graph) {
     std::string oldModuleName = op.getKernelModuleName().str();
     std::string oldFuncName = op.getKernelName().str();
     
-    auto it = renameMap.find({oldModuleName, oldFuncName});
-    if (it != renameMap.end()) {
-      std::string newFuncName = it->second;
+    auto funcKey = std::make_pair(oldModuleName, oldFuncName);
+    auto renameIt = renameMap.find(funcKey);
+    
+    if (renameIt != renameMap.end()) {
+      std::string newModuleName = renameIt->second.first;
+      std::string newFuncName = renameIt->second.second;
       
       // Create new symbol reference
       auto newKernel = SymbolRefAttr::get(
           builder.getContext(),
-          StringAttr::get(builder.getContext(), combinedName),
+          StringAttr::get(builder.getContext(), newModuleName),
           {SymbolRefAttr::get(builder.getContext(), newFuncName)});
       
-      // Update attribute
+      // Update kernel reference
       op->setAttr("kernel", newKernel);
     }
   });
