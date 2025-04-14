@@ -11,6 +11,8 @@ add_onnx_mlir_library(OMMlirDialects
   IrReorganization.cpp
   KernelParallelizationPass.cpp
   TopoLogicalSort.cpp
+  KernelCostEstimator.cpp
+  KernelExecutionOptimizer.cpp
 
   DEPENDS
   OMKrnlIncGen

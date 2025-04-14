@@ -37,23 +37,27 @@ void registerOMPasses(int optLevel) {
   // function to make themselves available as a command-line option.
 
 
-  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modified by p
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modefied by p
     return krnl::createRemoveRedundantSCFIfPass();
   });
 
-  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modified by p
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modefied by p
     return krnl::createInsertGPUAllocPass();
   });
 
-  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modified by p
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modefied by p
     return krnl::createKernelParallelizationPass();
   });
 
-  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modified by p
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modefied by p
+    return krnl::createKernelExecutionOptimizerPass();
+  });
+
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modefied by p
     return createParallelLoopTilingPass(false);
   });
 
-  // mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modified by p
+  // mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modefied by p
   //   return createLoopFusionPass(0,
   //     0,
   //     false,

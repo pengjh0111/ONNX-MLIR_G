@@ -134,6 +134,7 @@ std::unique_ptr<mlir::Pass> createConvertKrnlToLLVMPass(bool verifyInputTensors,
 std::unique_ptr<mlir::Pass> createRemoveRedundantSCFIfPass(); //modefied by p
 std::unique_ptr<mlir::Pass> createInsertGPUAllocPass(); //modefied by p
 std::unique_ptr<mlir::Pass> createKernelParallelizationPass(); //modefied by p
+std::unique_ptr<mlir::Pass> createKernelExecutionOptimizerPass(); //modefied by p
 } // namespace krnl
 
 /// Pass for lowering Onnx ops to TOSA dialect
