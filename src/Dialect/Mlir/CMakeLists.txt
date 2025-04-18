@@ -13,6 +13,7 @@ add_onnx_mlir_library(OMMlirDialects
   TopoLogicalSort.cpp
   KernelCostEstimator.cpp
   KernelExecutionOptimizer.cpp
+  TileSizeOptimizer.cpp
 
   DEPENDS
   OMKrnlIncGen

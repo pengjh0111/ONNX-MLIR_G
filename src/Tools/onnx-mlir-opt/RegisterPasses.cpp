@@ -54,7 +54,8 @@ void registerOMPasses(int optLevel) {
   });
 
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modefied by p
-    return createParallelLoopTilingPass(false);
+    return createParallelLoopTilingPass(true);
+    // return createParallelLoopTilingPass();
   });
 
   // mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modefied by p

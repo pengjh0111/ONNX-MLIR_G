@@ -109,6 +109,7 @@ std::unique_ptr<mlir::Pass> createLowerToStablehloPass(bool enableUnroll);
 std::unique_ptr<mlir::Pass> createElideConstGlobalValuePass();
 
 std::unique_ptr<mlir::Pass> createParallelLoopTilingPass(bool noMinMaxBounds); //modefied by p
+// std::unique_ptr<mlir::Pass> createParallelLoopTilingPass(); //modefied by p
 
 // std::unique_ptr<mlir::Pass> createLoopFusionPass(unsigned fastMemorySpace,
 //     uint64_t localBufSizeThreshold,
