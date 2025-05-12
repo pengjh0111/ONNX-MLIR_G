@@ -24,6 +24,12 @@ public:
     return "Convert host-side memref.alloc, memref.reinterpret_cast, and krnl.global derived memory values to gpu.alloc, "
            "and insert necessary copy operations (static case only)."; 
   }
+  private:
+  // Member function declaration
+  Value processOperand(OpBuilder &builder, Operation *contextOp, Location loc, Value operand, bool &needUpdateUsers);
+
+  // Global replacement map to avoid duplicate GPU allocations
+  DenseMap<Value, Value> replacementMap;
 };
 
 static Value createGpuAllocAndCopy(OpBuilder &builder, Location loc, Value origVal,
@@ -69,8 +75,15 @@ static Value createGpuAllocAndCopy(OpBuilder &builder, Location loc, Value origV
 /// call createGpuAllocAndCopy as appropriate to obtain a GPU memory variable;
 /// if the operand comes from memref.alloc and does not require a copy, return a flag so that all users of memref.alloc
 /// can be replaced immediately.
-static Value processOperand(OpBuilder &builder, Operation *launchOp, Location loc, Value operand, bool &needUpdateUsers) {
+Value InsertGPUAllocPass::processOperand(OpBuilder &builder, Operation *launchOp, Location loc, Value operand, bool &needUpdateUsers) {
   Operation *defOp = operand.getDefiningOp();
+
+  // Check if we already have a replacement for this value
+  if (replacementMap.count(operand)) {
+    needUpdateUsers = false;
+    return replacementMap[operand];
+  }
+
   llvm::SmallVector<Value, 4> dims;
   if (auto memType = operand.getType().dyn_cast<MemRefType>()) {
     for (unsigned i = 0, e = memType.getRank(); i < e; ++i) {
@@ -78,7 +91,7 @@ static Value processOperand(OpBuilder &builder, Operation *launchOp, Location lo
         dims.push_back(builder.create<memref::DimOp>(loc, operand, i));
     }
     if (!dims.empty())
-      llvm::report_fatal_error("InsertGPUAllocsPass: 不支持动态维度");
+      llvm::report_fatal_error("InsertGPUAllocsPass: Dynamic dimensions not supported");
   }
 
   // if (defOp && (isa<memref::AllocOp>(defOp) ||
@@ -132,7 +145,10 @@ static Value processOperand(OpBuilder &builder, Operation *launchOp, Location lo
       builder.setInsertionPointToStart(&funcOp.getBody().front());
       needUpdateUsers = true;
     }
-    return createGpuAllocAndCopy(builder, loc, operand, dims, doCopy);
+    // return createGpuAllocAndCopy(builder, loc, operand, dims, doCopy);
+    Value newVal = createGpuAllocAndCopy(builder, loc, operand, dims, doCopy);
+    replacementMap[operand] = newVal;
+    return newVal;
   }
 
 
@@ -180,6 +196,68 @@ void InsertGPUAllocPass::runOnOperation() {
     if (launchChanged)
       launchOp.getOperation()->setOperands(newOperands);
   });
+
+  // Second pass: Handle memref.extract_aligned_pointer_as_index operations for mgpuCudnn calls
+  module.walk([&](memref::ExtractAlignedPointerAsIndexOp extractOp) {
+    Value memref = extractOp.getSource();
+    Operation *defOp = memref.getDefiningOp();
+    
+    // Check if this memref comes from krnl.global or memref.alloc
+    if (defOp && (defOp->getName().getStringRef() == "krnl.global" ||
+                  isa<memref::AllocOp>(defOp))) {
+      
+      // Check if we've already created a replacement for this value
+      if (replacementMap.count(memref)) {
+        extractOp.setOperand(replacementMap[memref]);
+        return;
+      }
+      
+      // Check if the result flows into an mgpuCudnn call
+      bool flowsToMgpuCudnn = false;
+      for (Operation *user : extractOp->getResult(0).getUsers()) {
+        // Trace through inttoptr and index_cast operations
+        while (user && (isa<arith::IndexCastOp>(user) || user->getName().getStringRef() == "llvm.inttoptr")) {
+          if (user->getNumResults() > 0 && !user->getResult(0).getUses().empty()) {
+            user = *user->getResult(0).getUsers().begin();
+          } else {
+            break;
+          }
+        }
+        
+        // Check if we reached a call operation
+        if (user && isa<func::CallOp>(user)) {
+          auto callOp = cast<func::CallOp>(user);
+          if (callOp.getCallee().starts_with("mgpuCudnn")) {
+            flowsToMgpuCudnn = true;
+            break;
+          }
+        }
+      }
+      
+      if (flowsToMgpuCudnn) {
+        // Create gpu.alloc and copy
+        bool doCopy = (defOp->getName().getStringRef() == "krnl.global");
+        bool updateUsers = false;
+        
+        // Use processOperand to ensure we use the global replacement map
+        Value gpuMem = this->processOperand(builder, extractOp.getOperation(), extractOp.getLoc(), memref, updateUsers);
+        
+        // Replace the operand of the extract operation
+        extractOp.setOperand(gpuMem);
+        
+        // Handle memref.alloc replacement if needed
+        if (updateUsers && isa<memref::AllocOp>(defOp)) {
+          SmallVector<OpOperand*, 8> operandUses;
+          for (OpOperand &use : memref.getUses())
+            operandUses.push_back(&use);
+          for (OpOperand *use : operandUses) {
+            use->set(gpuMem);
+          }
+          defOp->erase();
+        }
+      }
+    }
+  });
 }
 
 } // end anonymous namespace
@@ -192,6 +270,6 @@ namespace onnx_mlir {
   }
   
   } // namespace krnl
-  } // namespace onnx_mlir
+} // namespace onnx_mlir
   
 static mlir::PassRegistration<InsertGPUAllocPass> pass;
