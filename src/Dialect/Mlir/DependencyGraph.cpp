@@ -343,6 +343,15 @@ void dumpDependencyGraph(DependencyGraph &graph) {
 std::unique_ptr<DependencyGraph> buildDependencyGraph(func::FuncOp funcOp) {
   auto graph = std::make_unique<DependencyGraph>();
   
+  // 创建程序顺序映射，记录每个操作的原始顺序
+  llvm::DenseMap<Operation*, unsigned> programOrder;
+  unsigned orderCounter = 0;
+  
+  // 遍历函数体收集操作顺序
+  funcOp.walk([&](Operation* op) {
+    programOrder[op] = orderCounter++;
+  });
+
   // First pass: create nodes for all kernels and loop nests
   funcOp.walk([&](Operation* op) {
     if (isKernelLaunch(op)) {
@@ -379,7 +388,8 @@ std::unique_ptr<DependencyGraph> buildDependencyGraph(func::FuncOp funcOp) {
         if (otherNode == node) continue;
         
         // If this node's output is another node's input, add an edge
-        if (otherNode->inputs.count(output)) {
+        if (otherNode->inputs.count(output) && 
+            programOrder[node->op] < programOrder[otherNode->op]) { //确保依赖边满足原IR执行次序，避免出现虚假的依赖边
           graph->addEdge(node, otherNode);
         }
       }

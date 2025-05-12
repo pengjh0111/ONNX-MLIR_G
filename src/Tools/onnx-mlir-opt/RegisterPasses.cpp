@@ -36,6 +36,9 @@ void registerOMPasses(int optLevel) {
   // All passes implemented within onnx-mlir should register within this
   // function to make themselves available as a command-line option.
 
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modefied by p
+    return createONNXToCuDNNPass();
+  });
 
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modefied by p
     return krnl::createRemoveRedundantSCFIfPass();
