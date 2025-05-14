@@ -108,15 +108,17 @@ std::unique_ptr<mlir::Pass> createLowerToStablehloPass(bool enableUnroll);
 /// Pass for eliding the values of global Krnl operations.
 std::unique_ptr<mlir::Pass> createElideConstGlobalValuePass();
 
-std::unique_ptr<mlir::Pass> createONNXToCuDNNPass(); //modefied by p
+std::unique_ptr<mlir::Pass> createRedundantPointerConversionPass(); //modified by p
 
-std::unique_ptr<mlir::Pass> createParallelLoopTilingPass(bool noMinMaxBounds); //modefied by p
-// std::unique_ptr<mlir::Pass> createParallelLoopTilingPass(); //modefied by p
+std::unique_ptr<mlir::Pass> createONNXToCuDNNPass(); //modified by p
+
+std::unique_ptr<mlir::Pass> createParallelLoopTilingPass(bool noMinMaxBounds); //modified by p
+// std::unique_ptr<mlir::Pass> createParallelLoopTilingPass(); //modified by p
 
 // std::unique_ptr<mlir::Pass> createLoopFusionPass(unsigned fastMemorySpace,
 //     uint64_t localBufSizeThreshold,
 //     bool maximalFusion,
-//     enum FusionMode fusionMode); //modefied by p
+//     enum FusionMode fusionMode); //modified by p
 
 namespace krnl {
 /// Pass for lowering frontend dialects to Krnl IR dialect.
@@ -134,10 +136,10 @@ std::unique_ptr<mlir::Pass> createConvertKrnlToLLVMPass(bool verifyInputTensors,
     bool useLRODATA, bool storeConstantsToFile,
     float constantsToFileSingleThreshold, float constantsToFileTotalThreshold,
     std::string outputNameNoExt, bool enableParallel);
-std::unique_ptr<mlir::Pass> createRemoveRedundantSCFIfPass(); //modefied by p
-std::unique_ptr<mlir::Pass> createInsertGPUAllocPass(); //modefied by p
-std::unique_ptr<mlir::Pass> createKernelParallelizationPass(); //modefied by p
-std::unique_ptr<mlir::Pass> createKernelExecutionOptimizerPass(); //modefied by p
+std::unique_ptr<mlir::Pass> createRemoveRedundantSCFIfPass(); //modified by p
+std::unique_ptr<mlir::Pass> createInsertGPUAllocPass(); //modified by p
+std::unique_ptr<mlir::Pass> createKernelParallelizationPass(); //modified by p
+std::unique_ptr<mlir::Pass> createKernelExecutionOptimizerPass(); //modified by p
 } // namespace krnl
 
 /// Pass for lowering Onnx ops to TOSA dialect

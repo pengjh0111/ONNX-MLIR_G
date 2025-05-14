@@ -15,6 +15,7 @@ add_onnx_mlir_library(OMMlirDialects
   KernelExecutionOptimizer.cpp
   TileSizeOptimizer.cpp
   ConvertONNXTocuDNN.cpp
+  EliminateRedundantPtrConversion.cpp
 
   DEPENDS
   OMKrnlIncGen

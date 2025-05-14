@@ -275,6 +275,706 @@ public:
 }
 };
 
+// Pattern to convert onnx.Add to a call to mgpuCudnnAdd
+class AddOpLowering : public OpRewritePattern<mlir::ONNXAddOp> {
+public:
+  using OpRewritePattern<mlir::ONNXAddOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(mlir::ONNXAddOp addOp, PatternRewriter &rewriter) const override {
+    // Get the location for error reporting
+    Location loc = addOp.getLoc();
+    LLVM_DEBUG(llvm::dbgs() << "Converting onnx.Add at " << loc << "\n");
+
+    // Get the input tensors
+    Value inputA = addOp.getA();
+    Value inputB = addOp.getB();
+    
+    // Get the input types
+    auto inputTypeA = mlir::dyn_cast<RankedTensorType>(inputA.getType());
+    auto inputTypeB = mlir::dyn_cast<RankedTensorType>(inputB.getType());
+    
+    if (!inputTypeA || !inputTypeA.hasStaticShape() || !inputTypeB || !inputTypeB.hasStaticShape()) {
+      return rewriter.notifyMatchFailure(addOp, "Inputs must have static shapes");
+    }
+    
+    // Extract input dimensions
+    auto inputShapeA = inputTypeA.getShape();
+    if (inputShapeA.size() < 1 || inputShapeA.size() > 4) {
+      return rewriter.notifyMatchFailure(addOp, "Input must be 1D to 4D tensor");
+    }
+    
+    // Pad shape to 4D (NCHW) if needed
+    std::vector<int64_t> paddedShapeA(4, 1);
+    int offset = 4 - inputShapeA.size();
+    for (size_t i = 0; i < inputShapeA.size(); ++i) {
+      paddedShapeA[i + offset] = inputShapeA[i];
+    }
+    
+    int64_t n = paddedShapeA[0];
+    int64_t c = paddedShapeA[1];
+    int64_t h = paddedShapeA[2];
+    int64_t w = paddedShapeA[3];
+    
+    // Create constants for integer parameters
+    auto i32Type = rewriter.getI32Type();
+    auto createI32Const = [&](int64_t value) -> Value {
+      return rewriter.create<arith::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(value));
+    };
+    
+    auto nValue = createI32Const(n);
+    auto cValue = createI32Const(c);
+    auto hValue = createI32Const(h);
+    auto wValue = createI32Const(w);
+    
+    // Prepare input and output buffers
+    auto markForBufferization = [&](Value tensor) -> Value {
+      auto tensorType = tensor.getType().cast<RankedTensorType>();
+      auto memrefType = MemRefType::get(
+        tensorType.getShape(),
+        tensorType.getElementType());
+      return rewriter.create<UnrealizedConversionCastOp>(
+        loc, TypeRange{memrefType}, ValueRange{tensor}).getResult(0);
+    };
+    
+    auto inputMemrefA = markForBufferization(inputA);
+    auto inputMemrefB = markForBufferization(inputB);
+    
+    // Convert memrefs to void pointers
+    auto ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
+    
+    auto getPtr = [&](Value memref) -> Value {
+      // Extract the aligned pointer as index
+      auto indexType = rewriter.getIndexType();
+      auto ptrIndex = rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(loc, indexType, memref);
+      
+      auto i64Type = rewriter.getIntegerType(64);
+      auto ptrI64 = rewriter.create<arith::IndexCastOp>(loc, i64Type, ptrIndex);
+      
+      return rewriter.create<LLVM::IntToPtrOp>(loc, ptrType, ptrI64);
+    };
+    
+    auto inputPtrA = getPtr(inputMemrefA);
+    auto inputPtrB = getPtr(inputMemrefB);
+    
+    // Allocate output memref
+    auto outputType = mlir::dyn_cast<RankedTensorType>(addOp.getResult().getType());
+    auto outputMemrefType = MemRefType::get(outputType.getShape(), outputType.getElementType());
+    auto outputMemref = rewriter.create<memref::AllocOp>(loc, outputMemrefType);
+    auto outputPtr = getPtr(outputMemref);
+    
+    // Create a CUDA stream
+    auto moduleOp = addOp->getParentOfType<ModuleOp>();
+    func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
+    
+    if (!streamCreateFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto streamCreateType = rewriter.getFunctionType({}, {ptrType});
+      streamCreateFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuStreamCreate", streamCreateType);
+      streamCreateFunc.setPrivate();
+    }
+    
+    auto streamCallOp = rewriter.create<func::CallOp>(
+      loc, TypeRange{ptrType}, streamCreateFunc.getName(), ValueRange{});
+    auto streamPtr = streamCallOp.getResult(0);
+    
+    // Look up or create the mgpuCudnnAdd function
+    func::FuncOp funcOp = moduleOp.lookupSymbol<func::FuncOp>("mgpuCudnnAdd");
+    
+    if (!funcOp) {
+      LLVM_DEBUG(llvm::dbgs() << "Creating mgpuCudnnAdd declaration\n");
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto funcType = rewriter.getFunctionType({
+        ptrType, ptrType, ptrType,  // inputA, inputB, output
+        i32Type, i32Type, i32Type, i32Type,  // n, c, h, w
+        ptrType  // stream
+      }, {});
+      
+      funcOp = rewriter.create<func::FuncOp>(
+        loc, "mgpuCudnnAdd", funcType);
+      funcOp.setPrivate();
+    }
+    
+    // Call the function
+    std::vector<Value> args = {
+      inputPtrA, inputPtrB, outputPtr,
+      nValue, cValue, hValue, wValue,
+      streamPtr
+    };
+    
+    rewriter.create<func::CallOp>(
+      loc, TypeRange(), funcOp.getName(), ValueRange(args));
+    
+    // Synchronize and destroy the stream
+    func::FuncOp streamSyncFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamSynchronize");
+    
+    if (!streamSyncFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto streamSyncType = rewriter.getFunctionType({ptrType}, {});
+      streamSyncFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuStreamSynchronize", streamSyncType);
+      streamSyncFunc.setPrivate();
+    }
+    
+    rewriter.create<func::CallOp>(
+      loc, TypeRange(), streamSyncFunc.getName(), ValueRange{streamPtr});
+    
+    func::FuncOp streamDestroyFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamDestroy");
+    
+    if (!streamDestroyFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto streamDestroyType = rewriter.getFunctionType({ptrType}, {});
+      streamDestroyFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuStreamDestroy", streamDestroyType);
+      streamDestroyFunc.setPrivate();
+    }
+    
+    rewriter.create<func::CallOp>(
+      loc, TypeRange(), streamDestroyFunc.getName(), ValueRange{streamPtr});
+    
+    // Convert memref back to tensor
+    auto resultTensor = rewriter.create<UnrealizedConversionCastOp>(
+        loc, TypeRange{outputType}, ValueRange{outputMemref}).getResult(0);
+    
+    rewriter.replaceOp(addOp, resultTensor);
+    
+    LLVM_DEBUG(llvm::dbgs() << "Successfully converted onnx.Add to cuDNN call\n");
+    return success();
+  }
+};
+
+// Pattern to convert onnx.Sub to a call to mgpuCudnnSub
+class SubOpLowering : public OpRewritePattern<mlir::ONNXSubOp> {
+public:
+  using OpRewritePattern<mlir::ONNXSubOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(mlir::ONNXSubOp subOp, PatternRewriter &rewriter) const override {
+    // Get the location for error reporting
+    Location loc = subOp.getLoc();
+    LLVM_DEBUG(llvm::dbgs() << "Converting onnx.Sub at " << loc << "\n");
+
+    // Get the input tensors
+    Value inputA = subOp.getA();
+    Value inputB = subOp.getB();
+    
+    // Get the input types
+    auto inputTypeA = mlir::dyn_cast<RankedTensorType>(inputA.getType());
+    auto inputTypeB = mlir::dyn_cast<RankedTensorType>(inputB.getType());
+    
+    if (!inputTypeA || !inputTypeA.hasStaticShape() || !inputTypeB || !inputTypeB.hasStaticShape()) {
+      return rewriter.notifyMatchFailure(subOp, "Inputs must have static shapes");
+    }
+    
+    // Extract input dimensions
+    auto inputShapeA = inputTypeA.getShape();
+    if (inputShapeA.size() < 1 || inputShapeA.size() > 4) {
+      return rewriter.notifyMatchFailure(subOp, "Input must be 1D to 4D tensor");
+    }
+    
+    // Pad shape to 4D (NCHW) if needed
+    std::vector<int64_t> paddedShapeA(4, 1);
+    int offset = 4 - inputShapeA.size();
+    for (size_t i = 0; i < inputShapeA.size(); ++i) {
+      paddedShapeA[i + offset] = inputShapeA[i];
+    }
+    
+    int64_t n = paddedShapeA[0];
+    int64_t c = paddedShapeA[1];
+    int64_t h = paddedShapeA[2];
+    int64_t w = paddedShapeA[3];
+    
+    // Create constants for integer parameters
+    auto i32Type = rewriter.getI32Type();
+    auto createI32Const = [&](int64_t value) -> Value {
+      return rewriter.create<arith::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(value));
+    };
+    
+    auto nValue = createI32Const(n);
+    auto cValue = createI32Const(c);
+    auto hValue = createI32Const(h);
+    auto wValue = createI32Const(w);
+    
+    // Prepare input and output buffers
+    auto markForBufferization = [&](Value tensor) -> Value {
+      auto tensorType = tensor.getType().cast<RankedTensorType>();
+      auto memrefType = MemRefType::get(
+        tensorType.getShape(),
+        tensorType.getElementType());
+      return rewriter.create<UnrealizedConversionCastOp>(
+        loc, TypeRange{memrefType}, ValueRange{tensor}).getResult(0);
+    };
+    
+    auto inputMemrefA = markForBufferization(inputA);
+    auto inputMemrefB = markForBufferization(inputB);
+    
+    // Convert memrefs to void pointers
+    auto ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
+    
+    auto getPtr = [&](Value memref) -> Value {
+      // Extract the aligned pointer as index
+      auto indexType = rewriter.getIndexType();
+      auto ptrIndex = rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(loc, indexType, memref);
+      
+      auto i64Type = rewriter.getIntegerType(64);
+      auto ptrI64 = rewriter.create<arith::IndexCastOp>(loc, i64Type, ptrIndex);
+      
+      return rewriter.create<LLVM::IntToPtrOp>(loc, ptrType, ptrI64);
+    };
+    
+    auto inputPtrA = getPtr(inputMemrefA);
+    auto inputPtrB = getPtr(inputMemrefB);
+    
+    // Allocate output memref
+    auto outputType = mlir::dyn_cast<RankedTensorType>(subOp.getResult().getType());
+    auto outputMemrefType = MemRefType::get(outputType.getShape(), outputType.getElementType());
+    auto outputMemref = rewriter.create<memref::AllocOp>(loc, outputMemrefType);
+    auto outputPtr = getPtr(outputMemref);
+    
+    // Create a CUDA stream
+    auto moduleOp = subOp->getParentOfType<ModuleOp>();
+    func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
+    
+    if (!streamCreateFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto streamCreateType = rewriter.getFunctionType({}, {ptrType});
+      streamCreateFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuStreamCreate", streamCreateType);
+      streamCreateFunc.setPrivate();
+    }
+    
+    auto streamCallOp = rewriter.create<func::CallOp>(
+      loc, TypeRange{ptrType}, streamCreateFunc.getName(), ValueRange{});
+    auto streamPtr = streamCallOp.getResult(0);
+    
+    // Look up or create the mgpuCudnnSub function
+    func::FuncOp funcOp = moduleOp.lookupSymbol<func::FuncOp>("mgpuCudnnSub");
+    
+    if (!funcOp) {
+      LLVM_DEBUG(llvm::dbgs() << "Creating mgpuCudnnSub declaration\n");
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto funcType = rewriter.getFunctionType({
+        ptrType, ptrType, ptrType,  // inputA, inputB, output
+        i32Type, i32Type, i32Type, i32Type,  // n, c, h, w
+        ptrType  // stream
+      }, {});
+      
+      funcOp = rewriter.create<func::FuncOp>(
+        loc, "mgpuCudnnSub", funcType);
+      funcOp.setPrivate();
+    }
+    
+    // Call the function
+    std::vector<Value> args = {
+      inputPtrA, inputPtrB, outputPtr,
+      nValue, cValue, hValue, wValue,
+      streamPtr
+    };
+    
+    rewriter.create<func::CallOp>(
+      loc, TypeRange(), funcOp.getName(), ValueRange(args));
+    
+    // Synchronize and destroy the stream
+    func::FuncOp streamSyncFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamSynchronize");
+    
+    if (!streamSyncFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto streamSyncType = rewriter.getFunctionType({ptrType}, {});
+      streamSyncFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuStreamSynchronize", streamSyncType);
+      streamSyncFunc.setPrivate();
+    }
+    
+    rewriter.create<func::CallOp>(
+      loc, TypeRange(), streamSyncFunc.getName(), ValueRange{streamPtr});
+    
+    func::FuncOp streamDestroyFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamDestroy");
+    
+    if (!streamDestroyFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto streamDestroyType = rewriter.getFunctionType({ptrType}, {});
+      streamDestroyFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuStreamDestroy", streamDestroyType);
+      streamDestroyFunc.setPrivate();
+    }
+    
+    rewriter.create<func::CallOp>(
+      loc, TypeRange(), streamDestroyFunc.getName(), ValueRange{streamPtr});
+    
+    // Convert memref back to tensor
+    auto resultTensor = rewriter.create<UnrealizedConversionCastOp>(
+        loc, TypeRange{outputType}, ValueRange{outputMemref}).getResult(0);
+    
+    rewriter.replaceOp(subOp, resultTensor);
+    
+    LLVM_DEBUG(llvm::dbgs() << "Successfully converted onnx.Sub to cuDNN call\n");
+    return success();
+  }
+};
+
+// Pattern to convert onnx.Mul to a call to mgpuCudnnMul
+class MulOpLowering : public OpRewritePattern<mlir::ONNXMulOp> {
+public:
+  using OpRewritePattern<mlir::ONNXMulOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(mlir::ONNXMulOp mulOp, PatternRewriter &rewriter) const override {
+    // Get the location for error reporting
+    Location loc = mulOp.getLoc();
+    LLVM_DEBUG(llvm::dbgs() << "Converting onnx.Mul at " << loc << "\n");
+
+    // Get the input tensors
+    Value inputA = mulOp.getA();
+    Value inputB = mulOp.getB();
+    
+    // Get the input types
+    auto inputTypeA = mlir::dyn_cast<RankedTensorType>(inputA.getType());
+    auto inputTypeB = mlir::dyn_cast<RankedTensorType>(inputB.getType());
+    
+    if (!inputTypeA || !inputTypeA.hasStaticShape() || !inputTypeB || !inputTypeB.hasStaticShape()) {
+      return rewriter.notifyMatchFailure(mulOp, "Inputs must have static shapes");
+    }
+    
+    // Extract input dimensions
+    auto inputShapeA = inputTypeA.getShape();
+    if (inputShapeA.size() < 1 || inputShapeA.size() > 4) {
+      return rewriter.notifyMatchFailure(mulOp, "Input must be 1D to 4D tensor");
+    }
+    
+    // Pad shape to 4D (NCHW) if needed
+    std::vector<int64_t> paddedShapeA(4, 1);
+    int offset = 4 - inputShapeA.size();
+    for (size_t i = 0; i < inputShapeA.size(); ++i) {
+      paddedShapeA[i + offset] = inputShapeA[i];
+    }
+    
+    int64_t n = paddedShapeA[0];
+    int64_t c = paddedShapeA[1];
+    int64_t h = paddedShapeA[2];
+    int64_t w = paddedShapeA[3];
+    
+    // Create constants for integer parameters
+    auto i32Type = rewriter.getI32Type();
+    auto createI32Const = [&](int64_t value) -> Value {
+      return rewriter.create<arith::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(value));
+    };
+    
+    auto nValue = createI32Const(n);
+    auto cValue = createI32Const(c);
+    auto hValue = createI32Const(h);
+    auto wValue = createI32Const(w);
+    
+    // Prepare input and output buffers
+    auto markForBufferization = [&](Value tensor) -> Value {
+      auto tensorType = tensor.getType().cast<RankedTensorType>();
+      auto memrefType = MemRefType::get(
+        tensorType.getShape(),
+        tensorType.getElementType());
+      return rewriter.create<UnrealizedConversionCastOp>(
+        loc, TypeRange{memrefType}, ValueRange{tensor}).getResult(0);
+    };
+    
+    auto inputMemrefA = markForBufferization(inputA);
+    auto inputMemrefB = markForBufferization(inputB);
+    
+    // Convert memrefs to void pointers
+    auto ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
+    
+    auto getPtr = [&](Value memref) -> Value {
+      // Extract the aligned pointer as index
+      auto indexType = rewriter.getIndexType();
+      auto ptrIndex = rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(loc, indexType, memref);
+      
+      auto i64Type = rewriter.getIntegerType(64);
+      auto ptrI64 = rewriter.create<arith::IndexCastOp>(loc, i64Type, ptrIndex);
+      
+      return rewriter.create<LLVM::IntToPtrOp>(loc, ptrType, ptrI64);
+    };
+    
+    auto inputPtrA = getPtr(inputMemrefA);
+    auto inputPtrB = getPtr(inputMemrefB);
+    
+    // Allocate output memref
+    auto outputType = mlir::dyn_cast<RankedTensorType>(mulOp.getResult().getType());
+    auto outputMemrefType = MemRefType::get(outputType.getShape(), outputType.getElementType());
+    auto outputMemref = rewriter.create<memref::AllocOp>(loc, outputMemrefType);
+    auto outputPtr = getPtr(outputMemref);
+    
+    // Create a CUDA stream
+    auto moduleOp = mulOp->getParentOfType<ModuleOp>();
+    func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
+    
+    if (!streamCreateFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto streamCreateType = rewriter.getFunctionType({}, {ptrType});
+      streamCreateFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuStreamCreate", streamCreateType);
+      streamCreateFunc.setPrivate();
+    }
+    
+    auto streamCallOp = rewriter.create<func::CallOp>(
+      loc, TypeRange{ptrType}, streamCreateFunc.getName(), ValueRange{});
+    auto streamPtr = streamCallOp.getResult(0);
+    
+    // Look up or create the mgpuCudnnMul function
+    func::FuncOp funcOp = moduleOp.lookupSymbol<func::FuncOp>("mgpuCudnnMul");
+    
+    if (!funcOp) {
+      LLVM_DEBUG(llvm::dbgs() << "Creating mgpuCudnnMul declaration\n");
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto funcType = rewriter.getFunctionType({
+        ptrType, ptrType, ptrType,  // inputA, inputB, output
+        i32Type, i32Type, i32Type, i32Type,  // n, c, h, w
+        ptrType  // stream
+      }, {});
+      
+      funcOp = rewriter.create<func::FuncOp>(
+        loc, "mgpuCudnnMul", funcType);
+      funcOp.setPrivate();
+    }
+    
+    // Call the function
+    std::vector<Value> args = {
+      inputPtrA, inputPtrB, outputPtr,
+      nValue, cValue, hValue, wValue,
+      streamPtr
+    };
+    
+    rewriter.create<func::CallOp>(
+      loc, TypeRange(), funcOp.getName(), ValueRange(args));
+    
+    // Synchronize and destroy the stream
+    func::FuncOp streamSyncFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamSynchronize");
+    
+    if (!streamSyncFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto streamSyncType = rewriter.getFunctionType({ptrType}, {});
+      streamSyncFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuStreamSynchronize", streamSyncType);
+      streamSyncFunc.setPrivate();
+    }
+    
+    rewriter.create<func::CallOp>(
+      loc, TypeRange(), streamSyncFunc.getName(), ValueRange{streamPtr});
+    
+    func::FuncOp streamDestroyFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamDestroy");
+    
+    if (!streamDestroyFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto streamDestroyType = rewriter.getFunctionType({ptrType}, {});
+      streamDestroyFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuStreamDestroy", streamDestroyType);
+      streamDestroyFunc.setPrivate();
+    }
+    
+    rewriter.create<func::CallOp>(
+      loc, TypeRange(), streamDestroyFunc.getName(), ValueRange{streamPtr});
+    
+    // Convert memref back to tensor
+    auto resultTensor = rewriter.create<UnrealizedConversionCastOp>(
+        loc, TypeRange{outputType}, ValueRange{outputMemref}).getResult(0);
+    
+    rewriter.replaceOp(mulOp, resultTensor);
+    
+    LLVM_DEBUG(llvm::dbgs() << "Successfully converted onnx.Mul to cuDNN call\n");
+    return success();
+  }
+};
+
+// Pattern to convert onnx.Neg to a call to mgpuCudnnNeg
+class NegOpLowering : public OpRewritePattern<mlir::ONNXNegOp> {
+public:
+  using OpRewritePattern<mlir::ONNXNegOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(mlir::ONNXNegOp negOp, PatternRewriter &rewriter) const override {
+    // Get the location for error reporting
+    Location loc = negOp.getLoc();
+    LLVM_DEBUG(llvm::dbgs() << "Converting onnx.Neg at " << loc << "\n");
+
+    // Get the input tensor
+    Value input = negOp.getX();
+    
+    // Get the input type
+    auto inputType = mlir::dyn_cast<RankedTensorType>(input.getType());
+    
+    if (!inputType || !inputType.hasStaticShape()) {
+      return rewriter.notifyMatchFailure(negOp, "Input must have static shape");
+    }
+    
+    // Extract input dimensions
+    auto inputShape = inputType.getShape();
+    if (inputShape.size() < 1 || inputShape.size() > 4) {
+      return rewriter.notifyMatchFailure(negOp, "Input must be 1D to 4D tensor");
+    }
+    
+    // Pad shape to 4D (NCHW) if needed
+    std::vector<int64_t> paddedShape(4, 1);
+    int offset = 4 - inputShape.size();
+    for (size_t i = 0; i < inputShape.size(); ++i) {
+      paddedShape[i + offset] = inputShape[i];
+    }
+    
+    int64_t n = paddedShape[0];
+    int64_t c = paddedShape[1];
+    int64_t h = paddedShape[2];
+    int64_t w = paddedShape[3];
+    
+    // Create constants for integer parameters
+    auto i32Type = rewriter.getI32Type();
+    auto createI32Const = [&](int64_t value) -> Value {
+      return rewriter.create<arith::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(value));
+    };
+    
+    auto nValue = createI32Const(n);
+    auto cValue = createI32Const(c);
+    auto hValue = createI32Const(h);
+    auto wValue = createI32Const(w);
+    
+    // Prepare input and output buffers
+    auto markForBufferization = [&](Value tensor) -> Value {
+      auto tensorType = tensor.getType().cast<RankedTensorType>();
+      auto memrefType = MemRefType::get(
+        tensorType.getShape(),
+        tensorType.getElementType());
+      return rewriter.create<UnrealizedConversionCastOp>(
+        loc, TypeRange{memrefType}, ValueRange{tensor}).getResult(0);
+    };
+    
+    auto inputMemref = markForBufferization(input);
+    
+    // Convert memrefs to void pointers
+    auto ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
+    
+    auto getPtr = [&](Value memref) -> Value {
+      // Extract the aligned pointer as index
+      auto indexType = rewriter.getIndexType();
+      auto ptrIndex = rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(loc, indexType, memref);
+      
+      auto i64Type = rewriter.getIntegerType(64);
+      auto ptrI64 = rewriter.create<arith::IndexCastOp>(loc, i64Type, ptrIndex);
+      
+      return rewriter.create<LLVM::IntToPtrOp>(loc, ptrType, ptrI64);
+    };
+    
+    auto inputPtr = getPtr(inputMemref);
+    
+    // Allocate output memref
+    auto outputType = mlir::dyn_cast<RankedTensorType>(negOp.getResult().getType());
+    auto outputMemrefType = MemRefType::get(outputType.getShape(), outputType.getElementType());
+    auto outputMemref = rewriter.create<memref::AllocOp>(loc, outputMemrefType);
+    auto outputPtr = getPtr(outputMemref);
+    
+    // Create a CUDA stream
+    auto moduleOp = negOp->getParentOfType<ModuleOp>();
+    func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
+    
+    if (!streamCreateFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto streamCreateType = rewriter.getFunctionType({}, {ptrType});
+      streamCreateFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuStreamCreate", streamCreateType);
+      streamCreateFunc.setPrivate();
+    }
+    
+    auto streamCallOp = rewriter.create<func::CallOp>(
+      loc, TypeRange{ptrType}, streamCreateFunc.getName(), ValueRange{});
+    auto streamPtr = streamCallOp.getResult(0);
+    
+    // Look up or create the mgpuCudnnNeg function
+    func::FuncOp funcOp = moduleOp.lookupSymbol<func::FuncOp>("mgpuCudnnNeg");
+    
+    if (!funcOp) {
+      LLVM_DEBUG(llvm::dbgs() << "Creating mgpuCudnnNeg declaration\n");
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto funcType = rewriter.getFunctionType({
+        ptrType, ptrType,  // input, output
+        i32Type, i32Type, i32Type, i32Type,  // n, c, h, w
+        ptrType  // stream
+      }, {});
+      
+      funcOp = rewriter.create<func::FuncOp>(
+        loc, "mgpuCudnnNeg", funcType);
+      funcOp.setPrivate();
+    }
+    
+    // Call the function
+    std::vector<Value> args = {
+      inputPtr, outputPtr,
+      nValue, cValue, hValue, wValue,
+      streamPtr
+    };
+    
+    rewriter.create<func::CallOp>(
+      loc, TypeRange(), funcOp.getName(), ValueRange(args));
+    
+    // Synchronize and destroy the stream
+    func::FuncOp streamSyncFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamSynchronize");
+    
+    if (!streamSyncFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto streamSyncType = rewriter.getFunctionType({ptrType}, {});
+      streamSyncFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuStreamSynchronize", streamSyncType);
+      streamSyncFunc.setPrivate();
+    }
+    
+    rewriter.create<func::CallOp>(
+      loc, TypeRange(), streamSyncFunc.getName(), ValueRange{streamPtr});
+    
+    func::FuncOp streamDestroyFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamDestroy");
+    
+    if (!streamDestroyFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto streamDestroyType = rewriter.getFunctionType({ptrType}, {});
+      streamDestroyFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuStreamDestroy", streamDestroyType);
+      streamDestroyFunc.setPrivate();
+    }
+    
+    rewriter.create<func::CallOp>(
+      loc, TypeRange(), streamDestroyFunc.getName(), ValueRange{streamPtr});
+    
+    // Convert memref back to tensor
+    auto resultTensor = rewriter.create<UnrealizedConversionCastOp>(
+        loc, TypeRange{outputType}, ValueRange{outputMemref}).getResult(0);
+    
+    rewriter.replaceOp(negOp, resultTensor);
+    
+    LLVM_DEBUG(llvm::dbgs() << "Successfully converted onnx.Neg to cuDNN call\n");
+    return success();
+  }
+};
+
 // Pass to convert ONNX operations to cuDNN calls
 struct ONNXToCuDNNPass
     : public PassWrapper<ONNXToCuDNNPass, OperationPass<ModuleOp>> {
@@ -298,7 +998,11 @@ struct ONNXToCuDNNPass
     // Define the conversion patterns
     RewritePatternSet patterns(context);
     patterns.add<ConvOpLowering>(context);
-    
+    patterns.add<AddOpLowering>(context);
+    patterns.add<SubOpLowering>(context);
+    patterns.add<MulOpLowering>(context);
+    patterns.add<NegOpLowering>(context);
+
     // Apply patterns
     ConversionTarget target(*context);
     target.addLegalDialect<LLVM::LLVMDialect, func::FuncDialect, arith::ArithDialect, 
@@ -306,6 +1010,10 @@ struct ONNXToCuDNNPass
     target.addLegalOp<UnrealizedConversionCastOp>();
     target.addLegalOp<arith::IndexCastOp>();                       
     target.addIllegalOp<mlir::ONNXConvOp>();
+    target.addIllegalOp<mlir::ONNXAddOp>();
+    target.addIllegalOp<mlir::ONNXSubOp>();
+    target.addIllegalOp<mlir::ONNXMulOp>();
+    target.addIllegalOp<mlir::ONNXNegOp>();
     
     if (failed(applyPartialConversion(moduleOp, target, std::move(patterns)))) {
       signalPassFailure();

@@ -403,7 +403,11 @@ void FrontendToKrnlLoweringPass::runOnOperation() {
     target.addLegalOp<ONNXSqueezeV11Op>();
     target.addLegalOp<ONNXTransposeOp>();
 
-    target.addLegalOp<ONNXConvOp>(); // modefied by p
+    target.addLegalOp<ONNXConvOp>(); // modified by p
+    target.addLegalOp<ONNXAddOp>(); // modified by p
+    target.addLegalOp<ONNXSubOp>(); // modified by p
+    target.addLegalOp<ONNXMulOp>(); // modified by p
+    target.addLegalOp<ONNXNegOp>(); // modified by p
   }
 
   // Conversion target for accelerators.
