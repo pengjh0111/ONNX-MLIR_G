@@ -397,7 +397,7 @@ void FrontendToKrnlLoweringPass::runOnOperation() {
     // other ONNX operations. The following operations are prevented from
     // being lowered further. See the comment in the declaration of
     // 'emitIntermediateIR' for more details.
-    target.addLegalOp<ONNXMatMulOp>();
+    target.addLegalOp<ONNXMatMulOp>(); // modified by p
     target.addLegalOp<ONNXReshapeOp>();
     target.addLegalOp<ONNXSplitV11Op>();
     target.addLegalOp<ONNXSqueezeV11Op>();
@@ -408,6 +408,7 @@ void FrontendToKrnlLoweringPass::runOnOperation() {
     target.addLegalOp<ONNXSubOp>(); // modified by p
     target.addLegalOp<ONNXMulOp>(); // modified by p
     target.addLegalOp<ONNXNegOp>(); // modified by p
+    target.addLegalOp<ONNXGemmOp>(); // modified by p
   }
 
   // Conversion target for accelerators.
