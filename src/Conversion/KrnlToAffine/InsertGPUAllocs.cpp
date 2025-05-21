@@ -22,7 +22,9 @@ public:
   StringRef getArgument() const final { return "insert-gpu-alloc"; }
   StringRef getDescription() const final { 
     return "Convert host-side memref.alloc, memref.reinterpret_cast, and krnl.global derived memory values to gpu.alloc, "
-           "and insert necessary copy operations (static case only)."; 
+           "and insert necessary copy operations (static case only). "
+           "Note: This pass must be used after --lower-krnl-region, otherwise it will be ineffective as "
+           "it depends on krnl regions being properly lowered to standard operations first."; 
   }
   private:
   // Member function declaration
@@ -227,7 +229,7 @@ void InsertGPUAllocPass::runOnOperation() {
         // Check if we reached a call operation
         if (user && isa<func::CallOp>(user)) {
           auto callOp = cast<func::CallOp>(user);
-          if (callOp.getCallee().starts_with("mgpuCudnn")) {
+          if (callOp.getCallee().starts_with("mgpuCudnn") || callOp.getCallee().starts_with("mgpuCulibs")) {
             flowsToMgpuCudnn = true;
             break;
           }

@@ -2560,6 +2560,286 @@ public:
   }
 };
 
+// Pattern to convert onnx.MaxPoolSingleOut to a call to mgpuCudnnMaxPoolForward
+class MaxPoolOpLowering : public OpRewritePattern<mlir::ONNXMaxPoolSingleOutOp> {
+public:
+  using OpRewritePattern<mlir::ONNXMaxPoolSingleOutOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(mlir::ONNXMaxPoolSingleOutOp maxPoolOp, PatternRewriter &rewriter) const override {
+    // 获取位置用于错误报告
+    Location loc = maxPoolOp.getLoc();
+    LLVM_DEBUG(llvm::dbgs() << "Converting onnx.MaxPoolSingleOut at " << loc << "\n");
+
+    // 获取输入张量
+    Value input = maxPoolOp.getX();
+    
+    // 获取输入类型
+    auto inputType = mlir::dyn_cast<RankedTensorType>(input.getType());
+    if (!inputType || !inputType.hasStaticShape()) {
+      return rewriter.notifyMatchFailure(maxPoolOp, "Input must have static shape");
+    }
+    
+    // 获取输出类型
+    auto outputType = mlir::dyn_cast<RankedTensorType>(maxPoolOp.getO_Y().getType());
+    if (!outputType || !outputType.hasStaticShape()) {
+      return rewriter.notifyMatchFailure(maxPoolOp, "Output must have static shape");
+    }
+    
+    // 提取属性
+    std::vector<int64_t> kernelShape;
+    std::vector<int64_t> pads;
+    std::vector<int64_t> strides;
+    std::vector<int64_t> dilations;
+    
+    // 获取核形状（必需）
+    if (auto kernelShapeAttr = maxPoolOp.getKernelShapeAttr()) {
+      for (auto attr : kernelShapeAttr) {
+        kernelShape.push_back(attr.cast<IntegerAttr>().getInt());
+      }
+    } else {
+      return rewriter.notifyMatchFailure(maxPoolOp, "Kernel shape attribute is required");
+    }
+    
+    // 获取填充、步长和膨胀（可选，有默认值）
+    if (auto padsAttr = maxPoolOp.getPadsAttr()) {
+      for (auto attr : padsAttr) {
+        pads.push_back(attr.cast<IntegerAttr>().getInt());
+      }
+    } else {
+      // 默认：无填充
+      pads = std::vector<int64_t>(kernelShape.size() * 2, 0);
+    }
+    
+    if (auto stridesAttr = maxPoolOp.getStridesAttr()) {
+      for (auto attr : stridesAttr) {
+        strides.push_back(attr.cast<IntegerAttr>().getInt());
+      }
+    } else {
+      // 默认：步长为1
+      strides = std::vector<int64_t>(kernelShape.size(), 1);
+    }
+    
+    if (auto dilationsAttr = maxPoolOp.getDilationsAttr()) {
+      for (auto attr : dilationsAttr) {
+        dilations.push_back(attr.cast<IntegerAttr>().getInt());
+      }
+    } else {
+      // 默认：无膨胀
+      dilations = std::vector<int64_t>(kernelShape.size(), 1);
+    }
+    
+    // 检查auto_pad属性
+    std::string autoPad = "NOTSET";
+    if (auto autoPadAttr = maxPoolOp.getAutoPadAttr()) {
+      autoPad = autoPadAttr.getValue().str();
+    }
+    
+    // 当前仅支持"NOTSET"自动填充模式
+    if (autoPad != "NOTSET") {
+      return rewriter.notifyMatchFailure(maxPoolOp, "Only NOTSET auto_pad mode is supported");
+    }
+    
+    // 检查ceil_mode属性
+    int64_t ceilMode = 0;
+    if (auto ceilModeAttr = maxPoolOp.getCeilModeAttr()) {
+      ceilMode = ceilModeAttr.getValue().getSExtValue();
+    }
+    
+    // 当前仅支持ceil_mode == 0
+    if (ceilMode != 0) {
+      return rewriter.notifyMatchFailure(maxPoolOp, "Only ceil_mode=0 is supported");
+    }
+    
+    // 提取输入维度（NCHW）
+    auto inputShape = inputType.getShape();
+    if (inputShape.size() != 4) {
+      return rewriter.notifyMatchFailure(maxPoolOp, "Input must be 4D tensor (NCHW)");
+    }
+    int64_t n = inputShape[0];
+    int64_t c = inputShape[1];
+    int64_t h = inputShape[2];
+    int64_t w = inputShape[3];
+    
+    // 提取池化参数
+    if (kernelShape.size() != 2) {
+      return rewriter.notifyMatchFailure(maxPoolOp, "Only 2D pooling is supported");
+    }
+    int64_t kernel_h = kernelShape[0];
+    int64_t kernel_w = kernelShape[1];
+    
+    if (pads.size() != 4) {
+      return rewriter.notifyMatchFailure(maxPoolOp, "Pads must have 4 values");
+    }
+    int64_t pad_h_begin = pads[0]; // 顶部填充
+    int64_t pad_w_begin = pads[1]; // 左侧填充
+    int64_t pad_h_end = pads[2];   // 底部填充
+    int64_t pad_w_end = pads[3];   // 右侧填充
+    
+    if (strides.size() != 2) {
+      return rewriter.notifyMatchFailure(maxPoolOp, "Strides must have 2 values");
+    }
+    int64_t stride_h = strides[0];
+    int64_t stride_w = strides[1];
+    
+    if (dilations.size() != 2) {
+      return rewriter.notifyMatchFailure(maxPoolOp, "Dilations must have 2 values");
+    }
+    int64_t dilation_h = dilations[0];
+    int64_t dilation_w = dilations[1];
+    
+    // 创建整数参数常量
+    auto i32Type = rewriter.getI32Type();
+    auto createI32Const = [&](int64_t value) -> Value {
+      return rewriter.create<arith::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(value));
+    };
+    
+    auto nValue = createI32Const(n);
+    auto cValue = createI32Const(c);
+    auto hValue = createI32Const(h);
+    auto wValue = createI32Const(w);
+    auto kernelHValue = createI32Const(kernel_h);
+    auto kernelWValue = createI32Const(kernel_w);
+    auto padHBeginValue = createI32Const(pad_h_begin);
+    auto padWBeginValue = createI32Const(pad_w_begin);
+    auto padHEndValue = createI32Const(pad_h_end);
+    auto padWEndValue = createI32Const(pad_w_end);
+    auto strideHValue = createI32Const(stride_h);
+    auto strideWValue = createI32Const(stride_w);
+    auto dilationHValue = createI32Const(dilation_h);
+    auto dilationWValue = createI32Const(dilation_w);
+    
+    // 准备bufferization
+    auto markForBufferization = [&](Value tensor) -> Value {
+      auto tensorType = tensor.getType().cast<RankedTensorType>();
+      auto memrefType = MemRefType::get(
+        tensorType.getShape(),
+        tensorType.getElementType());
+      return rewriter.create<UnrealizedConversionCastOp>(
+        loc, TypeRange{memrefType}, ValueRange{tensor}).getResult(0);
+    };
+    
+    auto inputMemref = markForBufferization(input);
+    
+    // 转换memrefs为void指针
+    auto ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
+    
+    auto getPtr = [&](Value memref) -> Value {
+      // 提取对齐的指针作为索引
+      auto indexType = rewriter.getIndexType();
+      auto ptrIndex = rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(loc, indexType, memref);
+      
+      auto i64Type = rewriter.getIntegerType(64);
+      auto ptrI64 = rewriter.create<arith::IndexCastOp>(loc, i64Type, ptrIndex);
+      
+      return rewriter.create<LLVM::IntToPtrOp>(loc, ptrType, ptrI64);
+    };
+    
+    auto inputPtr = getPtr(inputMemref);
+    
+    // 分配输出memref
+    auto outputMemrefType = MemRefType::get(outputType.getShape(), outputType.getElementType());
+    auto outputMemref = rewriter.create<memref::AllocOp>(loc, outputMemrefType);
+    auto outputPtr = getPtr(outputMemref);
+    
+    // 创建CUDA流
+    auto moduleOp = maxPoolOp->getParentOfType<ModuleOp>();
+    func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
+    
+    if (!streamCreateFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto streamCreateType = rewriter.getFunctionType({}, {ptrType});
+      streamCreateFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuStreamCreate", streamCreateType);
+      streamCreateFunc.setPrivate();
+    }
+    
+    auto streamCallOp = rewriter.create<func::CallOp>(
+      loc, TypeRange{ptrType}, streamCreateFunc.getName(), ValueRange{});
+    auto streamPtr = streamCallOp.getResult(0);
+    
+    // 查找或创建mgpuCudnnMaxPoolForward函数
+    func::FuncOp funcOp = moduleOp.lookupSymbol<func::FuncOp>("mgpuCudnnMaxPoolForward");
+    
+    if (!funcOp) {
+      LLVM_DEBUG(llvm::dbgs() << "Creating mgpuCudnnMaxPoolForward declaration\n");
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto funcType = rewriter.getFunctionType({
+        i32Type, i32Type, i32Type, i32Type,  // n, c, h, w
+        i32Type, i32Type,                    // kernel_h, kernel_w
+        i32Type, i32Type,                    // pad_h_begin, pad_w_begin
+        i32Type, i32Type,                    // pad_h_end, pad_w_end
+        i32Type, i32Type,                    // stride_h, stride_w
+        i32Type, i32Type,                    // dilation_h, dilation_w
+        ptrType, ptrType,                    // input_data, output_data
+        ptrType                              // stream
+      }, {});
+      
+      funcOp = rewriter.create<func::FuncOp>(
+        loc, "mgpuCudnnMaxPoolForward", funcType);
+      funcOp.setPrivate();
+    }
+    
+    // 调用函数
+    std::vector<Value> args = {
+      nValue, cValue, hValue, wValue,
+      kernelHValue, kernelWValue,
+      padHBeginValue, padWBeginValue,
+      padHEndValue, padWEndValue,
+      strideHValue, strideWValue,
+      dilationHValue, dilationWValue,
+      inputPtr, outputPtr,
+      streamPtr
+    };
+    
+    rewriter.create<func::CallOp>(
+      loc, TypeRange(), funcOp.getName(), ValueRange(args));
+    
+    // 同步并销毁流
+    func::FuncOp streamSyncFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamSynchronize");
+    
+    if (!streamSyncFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto streamSyncType = rewriter.getFunctionType({ptrType}, {});
+      streamSyncFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuStreamSynchronize", streamSyncType);
+      streamSyncFunc.setPrivate();
+    }
+    
+    rewriter.create<func::CallOp>(
+      loc, TypeRange(), streamSyncFunc.getName(), ValueRange{streamPtr});
+    
+    func::FuncOp streamDestroyFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamDestroy");
+    
+    if (!streamDestroyFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto streamDestroyType = rewriter.getFunctionType({ptrType}, {});
+      streamDestroyFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuStreamDestroy", streamDestroyType);
+      streamDestroyFunc.setPrivate();
+    }
+    
+    rewriter.create<func::CallOp>(
+      loc, TypeRange(), streamDestroyFunc.getName(), ValueRange{streamPtr});
+    
+    // 将memref转回tensor
+    auto resultTensor = rewriter.create<UnrealizedConversionCastOp>(
+        loc, TypeRange{outputType}, ValueRange{outputMemref}).getResult(0);
+    
+    rewriter.replaceOp(maxPoolOp, resultTensor);
+    
+    LLVM_DEBUG(llvm::dbgs() << "Successfully converted onnx.MaxPoolSingleOut to cuDNN call\n");
+    return success();
+  }
+};
+
 // Pass to convert ONNX operations to cuDNN calls
 struct ONNXToCuDNNPass
     : public PassWrapper<ONNXToCuDNNPass, OperationPass<ModuleOp>> {
@@ -2591,6 +2871,7 @@ struct ONNXToCuDNNPass
     patterns.add<GemmOpLowering>(context);
     patterns.add<FlattenGemmOpLowering>(context, /*benefit=*/2);
     patterns.add<FlattenMatMulOpLowering>(context, /*benefit=*/2);
+    patterns.add<MaxPoolOpLowering>(context);
 
     // Apply patterns
     ConversionTarget target(*context);
@@ -2605,6 +2886,7 @@ struct ONNXToCuDNNPass
     target.addIllegalOp<mlir::ONNXNegOp>();
     target.addIllegalOp<mlir::ONNXMatMulOp>();
     target.addIllegalOp<mlir::ONNXGemmOp>();
+    target.addIllegalOp<mlir::ONNXMaxPoolSingleOutOp>();
     
     if (failed(applyPartialConversion(moduleOp, target, std::move(patterns)))) {
       signalPassFailure();
