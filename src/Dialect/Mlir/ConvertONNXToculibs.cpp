@@ -2059,6 +2059,507 @@ public:
   }
 };
 
+// Pattern to convert onnx.Flatten+onnx.Gemm to a call to mgpuCulibsFlattenFullyConnectedForward
+class FlattenGemmOpLowering : public OpRewritePattern<mlir::ONNXGemmOp> {
+public:
+  using OpRewritePattern<mlir::ONNXGemmOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(mlir::ONNXGemmOp gemmOp, PatternRewriter &rewriter) const override {
+    // First, check if the input to the Gemm is from a Flatten operation
+    auto flattenOp = gemmOp.getA().getDefiningOp<mlir::ONNXFlattenOp>();
+    if (!flattenOp) {
+      // Not a Flatten->Gemm pattern, skip this operation
+      return failure();
+    }
+
+    // Get the location for error reporting
+    Location loc = gemmOp.getLoc();
+    LLVM_DEBUG(llvm::dbgs() << "Converting onnx.Flatten+onnx.Gemm at " << loc << "\n");
+
+    // Get the original input (before flattening)
+    Value originalInput = flattenOp.getInput();
+    Value weights = gemmOp.getB();
+    Value bias = gemmOp.getC();
+    
+    // Check that the Flatten has axis=1 (we only support that case)
+    int64_t flattenAxis = 1;
+    if (auto axisAttr = flattenOp.getAxisAttr()) {
+      flattenAxis = axisAttr.getValue().getSExtValue();
+    }
+    
+    if (flattenAxis != 1) {
+      return rewriter.notifyMatchFailure(flattenOp, "Only support flattening with axis=1");
+    }
+    
+    // Get the original input type
+    auto inputType = mlir::dyn_cast<RankedTensorType>(originalInput.getType());
+    if (!inputType || !inputType.hasStaticShape()) {
+      return rewriter.notifyMatchFailure(flattenOp, "Input must have static shape");
+    }
+    
+    // Get input dimensions
+    auto inputShape = inputType.getShape();
+    if (inputShape.size() != 4) {
+      return rewriter.notifyMatchFailure(flattenOp, "Only 4D NCHW inputs are supported for now");
+    }
+    
+    // Extract NCHW dimensions
+    int64_t batchSize = inputShape[0];
+    int64_t channels = inputShape[1];
+    int64_t height = inputShape[2];
+    int64_t width = inputShape[3];
+    
+    // Calculate flattened features
+    int64_t flattenedFeatures = channels * height * width;
+    
+    // Get the weights type
+    auto weightType = mlir::dyn_cast<RankedTensorType>(weights.getType());
+    if (!weightType || !weightType.hasStaticShape()) {
+      return rewriter.notifyMatchFailure(gemmOp, "Weights must have static shape");
+    }
+    
+    // Extract weight dimensions
+    auto weightShape = weightType.getShape();
+    if (weightShape.size() != 2) {
+      return rewriter.notifyMatchFailure(gemmOp, "Weights must be 2D");
+    }
+    
+    // Check that the flattened dimension matches the weight input dimension
+    if (flattenedFeatures != weightShape[0]) {
+      return rewriter.notifyMatchFailure(gemmOp, "Flattened dimension doesn't match weight dimension");
+    }
+    
+    int64_t outputFeatures = weightShape[1];
+    
+    // Get attributes from Gemm op
+    float alpha = 1.0f;
+    if (auto alphaAttr = dyn_cast_or_null<FloatAttr>(gemmOp.getAlphaAttr()))
+      alpha = alphaAttr.getValueAsDouble();
+      
+    float beta = 1.0f;
+    if (auto betaAttr = dyn_cast_or_null<FloatAttr>(gemmOp.getBetaAttr()))
+      beta = betaAttr.getValueAsDouble();
+    
+    bool transA = false;
+    if (auto transAAttr = gemmOp.getTransAAttr()) {
+      if (auto intAttr = dyn_cast<IntegerAttr>(transAAttr)) {
+        transA = intAttr.getValue().getSExtValue() != 0;
+      }
+    }
+
+    bool transB = false;
+    if (auto transBAttr = gemmOp.getTransBAttr()) {
+      if (auto intAttr = dyn_cast<IntegerAttr>(transBAttr)) {
+        transB = intAttr.getValue().getSExtValue() != 0;
+      }
+    }
+    
+    // Check for unsupported attributes
+    if (alpha != 1.0f) {
+      return rewriter.notifyMatchFailure(gemmOp, "Alpha != 1.0 not supported yet");
+    }
+    
+    if (beta != 1.0f) {
+      return rewriter.notifyMatchFailure(gemmOp, "Beta != 1.0 not supported yet");
+    }
+    
+    if (transA) {
+      return rewriter.notifyMatchFailure(gemmOp, "TransA=1 not supported for flattened FC");
+    }
+    
+    if (transB) {
+      return rewriter.notifyMatchFailure(gemmOp, "TransB=1 not supported for flattened FC");
+    }
+    
+    // Create constants for integer parameters
+    auto i32Type = rewriter.getI32Type();
+    auto createI32Const = [&](int64_t value) -> Value {
+      return rewriter.create<arith::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(value));
+    };
+    
+    auto batchSizeValue = createI32Const(batchSize);
+    auto channelsValue = createI32Const(channels);
+    auto heightValue = createI32Const(height);
+    auto widthValue = createI32Const(width);
+    auto outputFeaturesValue = createI32Const(outputFeatures);
+    
+    // Mark tensors for bufferization
+    auto markForBufferization = [&](Value tensor) -> Value {
+      if (!tensor)
+        return nullptr;
+      
+      auto tensorType = tensor.getType().cast<RankedTensorType>();
+      auto memrefType = MemRefType::get(
+        tensorType.getShape(),
+        tensorType.getElementType());
+      return rewriter.create<UnrealizedConversionCastOp>(
+        loc, TypeRange{memrefType}, ValueRange{tensor}).getResult(0);
+    };
+    
+    auto inputMemref = markForBufferization(originalInput);
+    auto weightMemref = markForBufferization(weights);
+    auto biasMemref = markForBufferization(bias);
+    
+    // Convert memrefs to void pointers
+    auto ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
+    
+    auto getPtr = [&](Value memref) -> Value {
+      if (!memref) {
+        MultiDialectBuilder<LLVMBuilder> create(rewriter, loc);
+        return create.llvm.null(ptrType);
+      }
+      
+      // Extract the aligned pointer as index
+      auto indexType = rewriter.getIndexType();
+      auto ptrIndex = rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(loc, indexType, memref);
+      
+      auto i64Type = rewriter.getIntegerType(64);
+      auto ptrI64 = rewriter.create<arith::IndexCastOp>(loc, i64Type, ptrIndex);
+      
+      return rewriter.create<LLVM::IntToPtrOp>(loc, ptrType, ptrI64);
+    };
+    
+    auto inputPtr = getPtr(inputMemref);
+    auto weightPtr = getPtr(weightMemref);
+    Value biasPtr;
+    if (biasMemref)
+      biasPtr = getPtr(biasMemref);
+    else {
+      MultiDialectBuilder<LLVMBuilder> create(rewriter, loc);
+      biasPtr = create.llvm.null(ptrType);
+    }
+    
+    // Allocate output memref
+    auto outputType = mlir::dyn_cast<RankedTensorType>(gemmOp.getResult().getType());
+    auto outputMemrefType = MemRefType::get(outputType.getShape(), outputType.getElementType());
+    auto outputMemref = rewriter.create<memref::AllocOp>(loc, outputMemrefType);
+    auto outputPtr = getPtr(outputMemref);
+    
+    // Create a CUDA stream
+    auto moduleOp = gemmOp->getParentOfType<ModuleOp>();
+    func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
+    
+    if (!streamCreateFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto streamCreateType = rewriter.getFunctionType({}, {ptrType});
+      streamCreateFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuStreamCreate", streamCreateType);
+      streamCreateFunc.setPrivate();
+    }
+    
+    auto streamCallOp = rewriter.create<func::CallOp>(
+      loc, TypeRange{ptrType}, streamCreateFunc.getName(), ValueRange{});
+    auto streamPtr = streamCallOp.getResult(0);
+    
+    // Create or locate the flatten-FC function declaration
+    func::FuncOp fcFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuCulibsFlattenFullyConnectedForward");
+    
+    if (!fcFunc) {
+      LLVM_DEBUG(llvm::dbgs() << "Creating mgpuCulibsFlattenFullyConnectedForward declaration\n");
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto fcFuncType = rewriter.getFunctionType({
+        i32Type, i32Type, i32Type, i32Type,  // batch_size, channels, height, width
+        i32Type,                             // output_features
+        ptrType, ptrType, ptrType,           // input_data, weight_data, bias_data
+        ptrType,                             // output_data
+        ptrType                              // stream
+      }, {});
+      
+      fcFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuCulibsFlattenFullyConnectedForward", fcFuncType);
+      fcFunc.setPrivate();
+    }
+    
+    // Call the function
+    std::vector<Value> args = {
+      batchSizeValue, channelsValue, heightValue, widthValue,
+      outputFeaturesValue,
+      inputPtr, weightPtr, biasPtr,
+      outputPtr, streamPtr
+    };
+    
+    rewriter.create<func::CallOp>(
+      loc, TypeRange(), fcFunc.getName(), ValueRange(args));
+    
+    // Synchronize the stream
+    func::FuncOp streamSyncFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamSynchronize");
+    
+    if (!streamSyncFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto streamSyncType = rewriter.getFunctionType({ptrType}, {});
+      streamSyncFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuStreamSynchronize", streamSyncType);
+      streamSyncFunc.setPrivate();
+    }
+    
+    rewriter.create<func::CallOp>(
+      loc, TypeRange(), streamSyncFunc.getName(), ValueRange{streamPtr});
+    
+    // Destroy the stream
+    func::FuncOp streamDestroyFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamDestroy");
+    
+    if (!streamDestroyFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto streamDestroyType = rewriter.getFunctionType({ptrType}, {});
+      streamDestroyFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuStreamDestroy", streamDestroyType);
+      streamDestroyFunc.setPrivate();
+    }
+    
+    rewriter.create<func::CallOp>(
+      loc, TypeRange(), streamDestroyFunc.getName(), ValueRange{streamPtr});
+    
+    // Convert memref back to tensor
+    auto resultTensor = rewriter.create<UnrealizedConversionCastOp>(
+        loc, TypeRange{outputType}, ValueRange{outputMemref}).getResult(0);
+    
+    rewriter.replaceOp(gemmOp, resultTensor);
+    
+    // The Flatten op will be removed automatically if it has no other uses
+    if (flattenOp.use_empty())
+      rewriter.eraseOp(flattenOp);
+    
+    LLVM_DEBUG(llvm::dbgs() << "Successfully converted onnx.Flatten+onnx.Gemm to FC call\n");
+    return success();
+  }
+};
+
+// Pattern to convert onnx.Flatten+onnx.MatMul to a call to mgpuCulibsFlattenFullyConnectedForward
+class FlattenMatMulOpLowering : public OpRewritePattern<mlir::ONNXMatMulOp> {
+public:
+  using OpRewritePattern<mlir::ONNXMatMulOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(mlir::ONNXMatMulOp matMulOp, PatternRewriter &rewriter) const override {
+    // First, check if the input to the MatMul is from a Flatten operation
+    auto flattenOp = matMulOp.getA().getDefiningOp<mlir::ONNXFlattenOp>();
+    if (!flattenOp) {
+      // Not a Flatten->MatMul pattern, skip this operation
+      return failure();
+    }
+
+    // Get the location for error reporting
+    Location loc = matMulOp.getLoc();
+    LLVM_DEBUG(llvm::dbgs() << "Converting onnx.Flatten+onnx.MatMul at " << loc << "\n");
+
+    // Get the original input (before flattening)
+    Value originalInput = flattenOp.getInput();
+    Value weights = matMulOp.getB();
+    
+    // Check that the Flatten has axis=1 (we only support that case)
+    int64_t flattenAxis = 1;
+    if (auto axisAttr = flattenOp.getAxisAttr()) {
+      flattenAxis = axisAttr.getValue().getSExtValue();
+    }
+    
+    if (flattenAxis != 1) {
+      return rewriter.notifyMatchFailure(flattenOp, "Only support flattening with axis=1");
+    }
+    
+    // Get the original input type
+    auto inputType = mlir::dyn_cast<RankedTensorType>(originalInput.getType());
+    if (!inputType || !inputType.hasStaticShape()) {
+      return rewriter.notifyMatchFailure(flattenOp, "Input must have static shape");
+    }
+    
+    // Get input dimensions
+    auto inputShape = inputType.getShape();
+    if (inputShape.size() != 4) {
+      return rewriter.notifyMatchFailure(flattenOp, "Only 4D NCHW inputs are supported for now");
+    }
+    
+    // Extract NCHW dimensions
+    int64_t batchSize = inputShape[0];
+    int64_t channels = inputShape[1];
+    int64_t height = inputShape[2];
+    int64_t width = inputShape[3];
+    
+    // Calculate flattened features
+    int64_t flattenedFeatures = channels * height * width;
+    
+    // Get the weights type
+    auto weightType = mlir::dyn_cast<RankedTensorType>(weights.getType());
+    if (!weightType || !weightType.hasStaticShape()) {
+      return rewriter.notifyMatchFailure(matMulOp, "Weights must have static shape");
+    }
+    
+    // Extract weight dimensions
+    auto weightShape = weightType.getShape();
+    if (weightShape.size() != 2) {
+      return rewriter.notifyMatchFailure(matMulOp, "Weights must be 2D");
+    }
+    
+    // Check that the flattened dimension matches the weight input dimension
+    if (flattenedFeatures != weightShape[0]) {
+      return rewriter.notifyMatchFailure(matMulOp, "Flattened dimension doesn't match weight dimension");
+    }
+    
+    int64_t outputFeatures = weightShape[1];
+    
+    // Create constants for integer parameters
+    auto i32Type = rewriter.getI32Type();
+    auto createI32Const = [&](int64_t value) -> Value {
+      return rewriter.create<arith::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(value));
+    };
+    
+    auto batchSizeValue = createI32Const(batchSize);
+    auto channelsValue = createI32Const(channels);
+    auto heightValue = createI32Const(height);
+    auto widthValue = createI32Const(width);
+    auto outputFeaturesValue = createI32Const(outputFeatures);
+    
+    // Mark tensors for bufferization
+    auto markForBufferization = [&](Value tensor) -> Value {
+      if (!tensor)
+        return nullptr;
+      
+      auto tensorType = tensor.getType().cast<RankedTensorType>();
+      auto memrefType = MemRefType::get(
+        tensorType.getShape(),
+        tensorType.getElementType());
+      return rewriter.create<UnrealizedConversionCastOp>(
+        loc, TypeRange{memrefType}, ValueRange{tensor}).getResult(0);
+    };
+    
+    auto inputMemref = markForBufferization(originalInput);
+    auto weightMemref = markForBufferization(weights);
+    
+    // Convert memrefs to void pointers
+    auto ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
+    
+    auto getPtr = [&](Value memref) -> Value {
+      if (!memref) {
+        MultiDialectBuilder<LLVMBuilder> create(rewriter, loc);
+        return create.llvm.null(ptrType);
+      }
+      
+      // Extract the aligned pointer as index
+      auto indexType = rewriter.getIndexType();
+      auto ptrIndex = rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(loc, indexType, memref);
+      
+      auto i64Type = rewriter.getIntegerType(64);
+      auto ptrI64 = rewriter.create<arith::IndexCastOp>(loc, i64Type, ptrIndex);
+      
+      return rewriter.create<LLVM::IntToPtrOp>(loc, ptrType, ptrI64);
+    };
+    
+    auto inputPtr = getPtr(inputMemref);
+    auto weightPtr = getPtr(weightMemref);
+    
+    // Create null bias pointer (MatMul doesn't have bias)
+    MultiDialectBuilder<LLVMBuilder> create(rewriter, loc);
+    auto nullBiasPtr = create.llvm.null(ptrType);
+    
+    // Allocate output memref
+    auto outputType = mlir::dyn_cast<RankedTensorType>(matMulOp.getResult().getType());
+    auto outputMemrefType = MemRefType::get(outputType.getShape(), outputType.getElementType());
+    auto outputMemref = rewriter.create<memref::AllocOp>(loc, outputMemrefType);
+    auto outputPtr = getPtr(outputMemref);
+    
+    // Create a CUDA stream
+    auto moduleOp = matMulOp->getParentOfType<ModuleOp>();
+    func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
+    
+    if (!streamCreateFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto streamCreateType = rewriter.getFunctionType({}, {ptrType});
+      streamCreateFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuStreamCreate", streamCreateType);
+      streamCreateFunc.setPrivate();
+    }
+    
+    auto streamCallOp = rewriter.create<func::CallOp>(
+      loc, TypeRange{ptrType}, streamCreateFunc.getName(), ValueRange{});
+    auto streamPtr = streamCallOp.getResult(0);
+    
+    // Create or locate the flatten-FC function declaration
+    func::FuncOp fcFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuCulibsFlattenFullyConnectedForward");
+    
+    if (!fcFunc) {
+      LLVM_DEBUG(llvm::dbgs() << "Creating mgpuCulibsFlattenFullyConnectedForward declaration\n");
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto fcFuncType = rewriter.getFunctionType({
+        i32Type, i32Type, i32Type, i32Type,  // batch_size, channels, height, width
+        i32Type,                             // output_features
+        ptrType, ptrType, ptrType,           // input_data, weight_data, bias_data
+        ptrType,                             // output_data
+        ptrType                              // stream
+      }, {});
+      
+      fcFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuCulibsFlattenFullyConnectedForward", fcFuncType);
+      fcFunc.setPrivate();
+    }
+    
+    // Call the function
+    std::vector<Value> args = {
+      batchSizeValue, channelsValue, heightValue, widthValue,
+      outputFeaturesValue,
+      inputPtr, weightPtr, nullBiasPtr,
+      outputPtr, streamPtr
+    };
+    
+    rewriter.create<func::CallOp>(
+      loc, TypeRange(), fcFunc.getName(), ValueRange(args));
+    
+    // Synchronize the stream
+    func::FuncOp streamSyncFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamSynchronize");
+    
+    if (!streamSyncFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto streamSyncType = rewriter.getFunctionType({ptrType}, {});
+      streamSyncFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuStreamSynchronize", streamSyncType);
+      streamSyncFunc.setPrivate();
+    }
+    
+    rewriter.create<func::CallOp>(
+      loc, TypeRange(), streamSyncFunc.getName(), ValueRange{streamPtr});
+    
+    // Destroy the stream
+    func::FuncOp streamDestroyFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamDestroy");
+    
+    if (!streamDestroyFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto streamDestroyType = rewriter.getFunctionType({ptrType}, {});
+      streamDestroyFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuStreamDestroy", streamDestroyType);
+      streamDestroyFunc.setPrivate();
+    }
+    
+    rewriter.create<func::CallOp>(
+      loc, TypeRange(), streamDestroyFunc.getName(), ValueRange{streamPtr});
+    
+    // Convert memref back to tensor
+    auto resultTensor = rewriter.create<UnrealizedConversionCastOp>(
+        loc, TypeRange{outputType}, ValueRange{outputMemref}).getResult(0);
+    
+    rewriter.replaceOp(matMulOp, resultTensor);
+    
+    // The Flatten op will be removed automatically if it has no other uses
+    if (flattenOp.use_empty())
+      rewriter.eraseOp(flattenOp);
+    
+    LLVM_DEBUG(llvm::dbgs() << "Successfully converted onnx.Flatten+onnx.MatMul to FC call\n");
+    return success();
+  }
+};
+
 // Pass to convert ONNX operations to cuDNN calls
 struct ONNXToCuDNNPass
     : public PassWrapper<ONNXToCuDNNPass, OperationPass<ModuleOp>> {
@@ -2088,6 +2589,8 @@ struct ONNXToCuDNNPass
     patterns.add<NegOpLowering>(context);
     patterns.add<MatMulOpLowering>(context);
     patterns.add<GemmOpLowering>(context);
+    patterns.add<FlattenGemmOpLowering>(context, /*benefit=*/2);
+    patterns.add<FlattenMatMulOpLowering>(context, /*benefit=*/2);
 
     // Apply patterns
     ConversionTarget target(*context);
