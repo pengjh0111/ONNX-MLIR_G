@@ -19,8 +19,103 @@ using namespace onnx_mlir;
 
 namespace {
 
+class ONNXToCuLibsPatternBase {
+protected:
+  // 辅助函数：确保Handle Pool已初始化
+void ensureHandlePoolInitialization(ModuleOp moduleOp, PatternRewriter &rewriter, Location loc, Type ptrType, func::FuncOp currentFunc) const {
+  // 检查当前函数中是否已有初始化调用
+  bool hasInitCall = false;
+  bool hasDestroyCall = false;
+  
+  currentFunc.walk([&](func::CallOp callOp) {
+    StringRef calleeName = callOp.getCallee();
+    if (calleeName == "mgpuInitHandlePool") {
+      hasInitCall = true;
+    }
+    if (calleeName == "mgpuDestroyHandlePool") {
+      hasDestroyCall = true;
+    }
+    return WalkResult::advance();
+  });
+  
+  // 如果已经有初始化和销毁调用，就不需要再添加
+  if (hasInitCall && hasDestroyCall) {
+    return;
+  }
+  
+  auto i32Type = rewriter.getI32Type();
+  
+  // 创建初始化函数声明
+  func::FuncOp initFunc = getOrCreateFunction(moduleOp, rewriter, loc, 
+      "mgpuInitHandlePool", rewriter.getFunctionType({i32Type}, {}));
+  
+  // 创建销毁函数声明
+  func::FuncOp destroyFunc = getOrCreateFunction(moduleOp, rewriter, loc, 
+      "mgpuDestroyHandlePool", rewriter.getFunctionType({}, {}));
+  
+  // 确保当前函数有函数体
+  if (currentFunc.getBody().empty()) {
+    // 如果函数体为空，创建一个基本的函数体
+    OpBuilder::InsertionGuard guard(rewriter);
+    Block *entryBlock = rewriter.createBlock(&currentFunc.getBody());
+    
+    // 添加一个返回语句
+    rewriter.setInsertionPointToEnd(entryBlock);
+    rewriter.create<func::ReturnOp>(loc);
+  }
+  
+  // 插入初始化和销毁调用
+  if (!hasInitCall) {
+    // 在函数开头插入初始化调用
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(&currentFunc.getBody().front());
+    
+    // 创建池大小常量（默认15个handle）
+    auto poolSizeValue = rewriter.create<arith::ConstantOp>(
+        loc, i32Type, rewriter.getI32IntegerAttr(15));
+    rewriter.create<func::CallOp>(
+        loc, TypeRange{}, initFunc.getName(), ValueRange{poolSizeValue});
+    
+    LLVM_DEBUG(llvm::dbgs() << "Inserted mgpuInitHandlePool call in current function: " 
+               << currentFunc.getName() << "\n");
+  }
+  
+  if (!hasDestroyCall) {
+    // 在函数结尾插入销毁调用
+    OpBuilder::InsertionGuard guard(rewriter);
+    
+    // 找到所有的返回语句，在每个返回语句前插入销毁调用
+    SmallVector<func::ReturnOp> returnOps;
+    currentFunc.walk([&](func::ReturnOp returnOp) {
+      returnOps.push_back(returnOp);
+    });
+    
+    for (auto returnOp : returnOps) {
+      rewriter.setInsertionPoint(returnOp);
+      rewriter.create<func::CallOp>(
+          loc, TypeRange{}, destroyFunc.getName(), ValueRange{});
+    }
+    
+    LLVM_DEBUG(llvm::dbgs() << "Inserted mgpuDestroyHandlePool call(s) in current function: " 
+               << currentFunc.getName() << "\n");
+  }
+}
+  // 辅助函数：获取或创建函数声明
+  func::FuncOp getOrCreateFunction(ModuleOp moduleOp, PatternRewriter &rewriter, 
+      Location loc, StringRef name, FunctionType funcType) const {
+    func::FuncOp funcOp = moduleOp.lookupSymbol<func::FuncOp>(name);
+    if (!funcOp) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      funcOp = rewriter.create<func::FuncOp>(loc, name, funcType);
+      funcOp.setPrivate();
+    }
+    return funcOp;
+  }
+};
+
 // Pattern to convert onnx.Conv to a call to mgpuCudnnConv2dForward
-class ConvOpLowering : public OpRewritePattern<mlir::ONNXConvOp> {
+class ConvOpLowering : public OpRewritePattern<mlir::ONNXConvOp>, public ONNXToCuLibsPatternBase {
 public:
   using OpRewritePattern<mlir::ONNXConvOp>::OpRewritePattern;
 
@@ -183,6 +278,10 @@ public:
     
     // Create a null CUDA stream (or get from context if available)
   auto moduleOp = convOp->getParentOfType<ModuleOp>();
+  auto currentFunc = convOp->getParentOfType<func::FuncOp>();
+
+  ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
+
   func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
   
   if (!streamCreateFunc) {
@@ -195,9 +294,24 @@ public:
     streamCreateFunc.setPrivate();
   }
   
+  func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuAcquirePooledHandles");
+
+  if (!handleCreateFunc) {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(moduleOp.getBody());
+    
+    auto handleCreateType = rewriter.getFunctionType({ptrType}, {});
+    handleCreateFunc = rewriter.create<func::FuncOp>(
+      loc, "mgpuAcquirePooledHandles", handleCreateType);
+    handleCreateFunc.setPrivate();
+  }
+
   auto streamCallOp = rewriter.create<func::CallOp>(
     loc, TypeRange{ptrType}, streamCreateFunc.getName(), ValueRange{});
   auto streamPtr = streamCallOp.getResult(0);
+
+  rewriter.create<func::CallOp>(
+    loc, TypeRange{}, "mgpuAcquirePooledHandles", ValueRange{streamPtr});
   
   func::FuncOp funcOp = moduleOp.lookupSymbol<func::FuncOp>("mgpuCudnnConv2dForward");
   
@@ -276,7 +390,7 @@ public:
 };
 
 // Pattern to convert onnx.Add to a call to mgpuCudnnAdd
-class AddOpLowering : public OpRewritePattern<mlir::ONNXAddOp> {
+class AddOpLowering : public OpRewritePattern<mlir::ONNXAddOp>, public ONNXToCuLibsPatternBase {
 public:
   using OpRewritePattern<mlir::ONNXAddOp>::OpRewritePattern;
 
@@ -546,6 +660,10 @@ public:
     
     // 创建 CUDA 流
     auto moduleOp = addOp->getParentOfType<ModuleOp>();
+    auto currentFunc = addOp->getParentOfType<func::FuncOp>();
+
+    ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
+
     func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
     
     if (!streamCreateFunc) {
@@ -557,11 +675,26 @@ public:
         loc, "mgpuStreamCreate", streamCreateType);
       streamCreateFunc.setPrivate();
     }
+
+    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuAcquirePooledHandles");
+
+    if (!handleCreateFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto handleCreateType = rewriter.getFunctionType({ptrType}, {});
+      handleCreateFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuAcquirePooledHandles", handleCreateType);
+      handleCreateFunc.setPrivate();
+    }
     
     auto streamCallOp = rewriter.create<func::CallOp>(
       loc, TypeRange{ptrType}, streamCreateFunc.getName(), ValueRange{});
     auto streamPtr = streamCallOp.getResult(0);
     
+    rewriter.create<func::CallOp>(
+      loc, TypeRange{}, "mgpuAcquirePooledHandles", ValueRange{streamPtr});
+
     // 根据是否为标量操作选择合适的函数
     func::FuncOp funcOp;
     
@@ -659,7 +792,7 @@ public:
 };
 
 // Pattern to convert onnx.Sub to a call to mgpuCudnnSub
-class SubOpLowering : public OpRewritePattern<mlir::ONNXSubOp> {
+class SubOpLowering : public OpRewritePattern<mlir::ONNXSubOp>, public ONNXToCuLibsPatternBase {
 public:
   using OpRewritePattern<mlir::ONNXSubOp>::OpRewritePattern;
 
@@ -929,6 +1062,10 @@ public:
     
     // 创建 CUDA 流
     auto moduleOp = subOp->getParentOfType<ModuleOp>();
+    auto currentFunc = subOp->getParentOfType<func::FuncOp>();
+
+    ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
+
     func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
     
     if (!streamCreateFunc) {
@@ -940,11 +1077,26 @@ public:
         loc, "mgpuStreamCreate", streamCreateType);
       streamCreateFunc.setPrivate();
     }
+
+    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuAcquirePooledHandles");
+
+    if (!handleCreateFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto handleCreateType = rewriter.getFunctionType({ptrType}, {});
+      handleCreateFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuAcquirePooledHandles", handleCreateType);
+      handleCreateFunc.setPrivate();
+    }
     
     auto streamCallOp = rewriter.create<func::CallOp>(
       loc, TypeRange{ptrType}, streamCreateFunc.getName(), ValueRange{});
     auto streamPtr = streamCallOp.getResult(0);
     
+    rewriter.create<func::CallOp>(
+      loc, TypeRange{}, "mgpuAcquirePooledHandles", ValueRange{streamPtr});
+
     // 根据是否为标量操作选择合适的函数
     func::FuncOp funcOp;
     
@@ -1042,7 +1194,7 @@ public:
 };
 
 // Pattern to convert onnx.Mul to a call to mgpuCudnnMul
-class MulOpLowering : public OpRewritePattern<mlir::ONNXMulOp> {
+class MulOpLowering : public OpRewritePattern<mlir::ONNXMulOp>, public ONNXToCuLibsPatternBase {
 public:
   using OpRewritePattern<mlir::ONNXMulOp>::OpRewritePattern;
 
@@ -1312,6 +1464,10 @@ public:
     
     // 创建 CUDA 流
     auto moduleOp = mulOp->getParentOfType<ModuleOp>();
+    auto currentFunc = mulOp->getParentOfType<func::FuncOp>();
+
+    ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
+
     func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
     
     if (!streamCreateFunc) {
@@ -1323,11 +1479,26 @@ public:
         loc, "mgpuStreamCreate", streamCreateType);
       streamCreateFunc.setPrivate();
     }
+
+    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuAcquirePooledHandles");
+
+    if (!handleCreateFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto handleCreateType = rewriter.getFunctionType({ptrType}, {});
+      handleCreateFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuAcquirePooledHandles", handleCreateType);
+      handleCreateFunc.setPrivate();
+    }
     
     auto streamCallOp = rewriter.create<func::CallOp>(
       loc, TypeRange{ptrType}, streamCreateFunc.getName(), ValueRange{});
     auto streamPtr = streamCallOp.getResult(0);
     
+    rewriter.create<func::CallOp>(
+      loc, TypeRange{}, "mgpuAcquirePooledHandles", ValueRange{streamPtr});
+
     // 根据是否为标量操作选择合适的函数
     func::FuncOp funcOp;
     
@@ -1425,7 +1596,7 @@ public:
 };
 
 // Pattern to convert onnx.Neg to a call to mgpuCudnnNeg
-class NegOpLowering : public OpRewritePattern<mlir::ONNXNegOp> {
+class NegOpLowering : public OpRewritePattern<mlir::ONNXNegOp>, public ONNXToCuLibsPatternBase {
 public:
   using OpRewritePattern<mlir::ONNXNegOp>::OpRewritePattern;
 
@@ -1509,6 +1680,10 @@ public:
     
     // Create a CUDA stream
     auto moduleOp = negOp->getParentOfType<ModuleOp>();
+    auto currentFunc = negOp->getParentOfType<func::FuncOp>();
+
+    ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
+
     func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
     
     if (!streamCreateFunc) {
@@ -1520,11 +1695,26 @@ public:
         loc, "mgpuStreamCreate", streamCreateType);
       streamCreateFunc.setPrivate();
     }
+
+    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuAcquirePooledHandles");
+
+    if (!handleCreateFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto handleCreateType = rewriter.getFunctionType({ptrType}, {});
+      handleCreateFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuAcquirePooledHandles", handleCreateType);
+      handleCreateFunc.setPrivate();
+    }
     
     auto streamCallOp = rewriter.create<func::CallOp>(
       loc, TypeRange{ptrType}, streamCreateFunc.getName(), ValueRange{});
     auto streamPtr = streamCallOp.getResult(0);
     
+    rewriter.create<func::CallOp>(
+      loc, TypeRange{}, "mgpuAcquirePooledHandles", ValueRange{streamPtr});
+
     // Look up or create the mgpuCudnnNeg function
     func::FuncOp funcOp = moduleOp.lookupSymbol<func::FuncOp>("mgpuCudnnNeg");
     
@@ -1597,7 +1787,7 @@ public:
 };
 
 // Pattern to convert onnx.MatMul to a call to mgpuCulibsFullyConnectedForward
-class MatMulOpLowering : public OpRewritePattern<mlir::ONNXMatMulOp> {
+class MatMulOpLowering : public OpRewritePattern<mlir::ONNXMatMulOp>, public ONNXToCuLibsPatternBase {
 public:
   using OpRewritePattern<mlir::ONNXMatMulOp>::OpRewritePattern;
 
@@ -1694,6 +1884,10 @@ public:
     
     // 创建CUDA流
     auto moduleOp = matMulOp->getParentOfType<ModuleOp>();
+    auto currentFunc = matMulOp->getParentOfType<func::FuncOp>();
+
+    ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
+
     func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
     
     if (!streamCreateFunc) {
@@ -1705,11 +1899,26 @@ public:
         loc, "mgpuStreamCreate", streamCreateType);
       streamCreateFunc.setPrivate();
     }
+
+    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuAcquirePooledHandles");
+
+    if (!handleCreateFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto handleCreateType = rewriter.getFunctionType({ptrType}, {});
+      handleCreateFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuAcquirePooledHandles", handleCreateType);
+      handleCreateFunc.setPrivate();
+    }
     
     auto streamCallOp = rewriter.create<func::CallOp>(
       loc, TypeRange{ptrType}, streamCreateFunc.getName(), ValueRange{});
     auto streamPtr = streamCallOp.getResult(0);
     
+    rewriter.create<func::CallOp>(
+      loc, TypeRange{}, "mgpuAcquirePooledHandles", ValueRange{streamPtr});
+  
     // 创建或查找FC函数声明
     func::FuncOp fcFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuCulibsFullyConnectedForward");
     
@@ -1788,7 +1997,7 @@ public:
 };
 
 // Pattern to convert onnx.Gemm to a call to mgpuCulibsFullyConnectedForward
-class GemmOpLowering : public OpRewritePattern<mlir::ONNXGemmOp> {
+class GemmOpLowering : public OpRewritePattern<mlir::ONNXGemmOp>, public ONNXToCuLibsPatternBase {
 public:
   using OpRewritePattern<mlir::ONNXGemmOp>::OpRewritePattern;
 
@@ -1970,6 +2179,10 @@ public:
     
     // 创建CUDA流
     auto moduleOp = gemmOp->getParentOfType<ModuleOp>();
+    auto currentFunc = gemmOp->getParentOfType<func::FuncOp>();
+
+    ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
+
     func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
     
     if (!streamCreateFunc) {
@@ -1981,11 +2194,26 @@ public:
         loc, "mgpuStreamCreate", streamCreateType);
       streamCreateFunc.setPrivate();
     }
+
+    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuAcquirePooledHandles");
+
+    if (!handleCreateFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto handleCreateType = rewriter.getFunctionType({ptrType}, {});
+      handleCreateFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuAcquirePooledHandles", handleCreateType);
+      handleCreateFunc.setPrivate();
+    }
     
     auto streamCallOp = rewriter.create<func::CallOp>(
       loc, TypeRange{ptrType}, streamCreateFunc.getName(), ValueRange{});
     auto streamPtr = streamCallOp.getResult(0);
     
+    rewriter.create<func::CallOp>(
+      loc, TypeRange{}, "mgpuAcquirePooledHandles", ValueRange{streamPtr});
+
     // 创建或查找FC函数声明
     func::FuncOp fcFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuCulibsFullyConnectedForward");
     
@@ -2060,7 +2288,7 @@ public:
 };
 
 // Pattern to convert onnx.Flatten+onnx.Gemm to a call to mgpuCulibsFlattenFullyConnectedForward
-class FlattenGemmOpLowering : public OpRewritePattern<mlir::ONNXGemmOp> {
+class FlattenGemmOpLowering : public OpRewritePattern<mlir::ONNXGemmOp>, public ONNXToCuLibsPatternBase {
 public:
   using OpRewritePattern<mlir::ONNXGemmOp>::OpRewritePattern;
 
@@ -2237,6 +2465,10 @@ public:
     
     // Create a CUDA stream
     auto moduleOp = gemmOp->getParentOfType<ModuleOp>();
+    auto currentFunc = gemmOp->getParentOfType<func::FuncOp>();
+
+    ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
+
     func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
     
     if (!streamCreateFunc) {
@@ -2248,11 +2480,26 @@ public:
         loc, "mgpuStreamCreate", streamCreateType);
       streamCreateFunc.setPrivate();
     }
+
+    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuAcquirePooledHandles");
+
+    if (!handleCreateFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto handleCreateType = rewriter.getFunctionType({ptrType}, {});
+      handleCreateFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuAcquirePooledHandles", handleCreateType);
+      handleCreateFunc.setPrivate();
+    }
     
     auto streamCallOp = rewriter.create<func::CallOp>(
       loc, TypeRange{ptrType}, streamCreateFunc.getName(), ValueRange{});
     auto streamPtr = streamCallOp.getResult(0);
     
+    rewriter.create<func::CallOp>(
+      loc, TypeRange{}, "mgpuAcquirePooledHandles", ValueRange{streamPtr});
+
     // Create or locate the flatten-FC function declaration
     func::FuncOp fcFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuCulibsFlattenFullyConnectedForward");
     
@@ -2333,7 +2580,7 @@ public:
 };
 
 // Pattern to convert onnx.Flatten+onnx.MatMul to a call to mgpuCulibsFlattenFullyConnectedForward
-class FlattenMatMulOpLowering : public OpRewritePattern<mlir::ONNXMatMulOp> {
+class FlattenMatMulOpLowering : public OpRewritePattern<mlir::ONNXMatMulOp>, public ONNXToCuLibsPatternBase {
 public:
   using OpRewritePattern<mlir::ONNXMatMulOp>::OpRewritePattern;
 
@@ -2465,6 +2712,10 @@ public:
     
     // Create a CUDA stream
     auto moduleOp = matMulOp->getParentOfType<ModuleOp>();
+    auto currentFunc = matMulOp->getParentOfType<func::FuncOp>();
+
+    ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
+
     func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
     
     if (!streamCreateFunc) {
@@ -2476,10 +2727,25 @@ public:
         loc, "mgpuStreamCreate", streamCreateType);
       streamCreateFunc.setPrivate();
     }
+
+    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuAcquirePooledHandles");
+
+    if (!handleCreateFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto handleCreateType = rewriter.getFunctionType({ptrType}, {});
+      handleCreateFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuAcquirePooledHandles", handleCreateType);
+      handleCreateFunc.setPrivate();
+    }
     
     auto streamCallOp = rewriter.create<func::CallOp>(
       loc, TypeRange{ptrType}, streamCreateFunc.getName(), ValueRange{});
     auto streamPtr = streamCallOp.getResult(0);
+
+    rewriter.create<func::CallOp>(
+      loc, TypeRange{}, "mgpuAcquirePooledHandles", ValueRange{streamPtr});
     
     // Create or locate the flatten-FC function declaration
     func::FuncOp fcFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuCulibsFlattenFullyConnectedForward");
@@ -2561,7 +2827,7 @@ public:
 };
 
 // Pattern to convert onnx.MaxPoolSingleOut to a call to mgpuCudnnMaxPoolForward
-class MaxPoolOpLowering : public OpRewritePattern<mlir::ONNXMaxPoolSingleOutOp> {
+class MaxPoolOpLowering : public OpRewritePattern<mlir::ONNXMaxPoolSingleOutOp>, public ONNXToCuLibsPatternBase {
 public:
   using OpRewritePattern<mlir::ONNXMaxPoolSingleOutOp>::OpRewritePattern;
 
@@ -2743,6 +3009,10 @@ public:
     
     // 创建CUDA流
     auto moduleOp = maxPoolOp->getParentOfType<ModuleOp>();
+    auto currentFunc = maxPoolOp->getParentOfType<func::FuncOp>();
+
+    ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
+
     func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
     
     if (!streamCreateFunc) {
@@ -2754,10 +3024,25 @@ public:
         loc, "mgpuStreamCreate", streamCreateType);
       streamCreateFunc.setPrivate();
     }
+
+    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuAcquirePooledHandles");
+
+    if (!handleCreateFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      
+      auto handleCreateType = rewriter.getFunctionType({ptrType}, {});
+      handleCreateFunc = rewriter.create<func::FuncOp>(
+        loc, "mgpuAcquirePooledHandles", handleCreateType);
+      handleCreateFunc.setPrivate();
+    }
     
     auto streamCallOp = rewriter.create<func::CallOp>(
       loc, TypeRange{ptrType}, streamCreateFunc.getName(), ValueRange{});
     auto streamPtr = streamCallOp.getResult(0);
+
+    rewriter.create<func::CallOp>(
+      loc, TypeRange{}, "mgpuAcquirePooledHandles", ValueRange{streamPtr});
     
     // 查找或创建mgpuCudnnMaxPoolForward函数
     func::FuncOp funcOp = moduleOp.lookupSymbol<func::FuncOp>("mgpuCudnnMaxPoolForward");
