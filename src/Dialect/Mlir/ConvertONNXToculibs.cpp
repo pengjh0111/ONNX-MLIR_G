@@ -278,9 +278,9 @@ public:
     
     // Create a null CUDA stream (or get from context if available)
   auto moduleOp = convOp->getParentOfType<ModuleOp>();
-  auto currentFunc = convOp->getParentOfType<func::FuncOp>();
+  // auto currentFunc = convOp->getParentOfType<func::FuncOp>();
 
-  ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
+  // ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
 
   func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
   
@@ -294,7 +294,7 @@ public:
     streamCreateFunc.setPrivate();
   }
   
-  func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuAcquirePooledHandles");
+  func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuCreateHandlesForStream");
 
   if (!handleCreateFunc) {
     OpBuilder::InsertionGuard guard(rewriter);
@@ -302,7 +302,7 @@ public:
     
     auto handleCreateType = rewriter.getFunctionType({ptrType}, {});
     handleCreateFunc = rewriter.create<func::FuncOp>(
-      loc, "mgpuAcquirePooledHandles", handleCreateType);
+      loc, "mgpuCreateHandlesForStream", handleCreateType);
     handleCreateFunc.setPrivate();
   }
 
@@ -311,7 +311,7 @@ public:
   auto streamPtr = streamCallOp.getResult(0);
 
   rewriter.create<func::CallOp>(
-    loc, TypeRange{}, "mgpuAcquirePooledHandles", ValueRange{streamPtr});
+    loc, TypeRange{}, "mgpuCreateHandlesForStream", ValueRange{streamPtr});
   
   func::FuncOp funcOp = moduleOp.lookupSymbol<func::FuncOp>("mgpuCudnnConv2dForward");
   
@@ -660,9 +660,9 @@ public:
     
     // 创建 CUDA 流
     auto moduleOp = addOp->getParentOfType<ModuleOp>();
-    auto currentFunc = addOp->getParentOfType<func::FuncOp>();
+    // auto currentFunc = addOp->getParentOfType<func::FuncOp>();
 
-    ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
+    // ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
 
     func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
     
@@ -676,7 +676,7 @@ public:
       streamCreateFunc.setPrivate();
     }
 
-    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuAcquirePooledHandles");
+    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuCreateHandlesForStream");
 
     if (!handleCreateFunc) {
       OpBuilder::InsertionGuard guard(rewriter);
@@ -684,7 +684,7 @@ public:
       
       auto handleCreateType = rewriter.getFunctionType({ptrType}, {});
       handleCreateFunc = rewriter.create<func::FuncOp>(
-        loc, "mgpuAcquirePooledHandles", handleCreateType);
+        loc, "mgpuCreateHandlesForStream", handleCreateType);
       handleCreateFunc.setPrivate();
     }
     
@@ -693,7 +693,7 @@ public:
     auto streamPtr = streamCallOp.getResult(0);
     
     rewriter.create<func::CallOp>(
-      loc, TypeRange{}, "mgpuAcquirePooledHandles", ValueRange{streamPtr});
+      loc, TypeRange{}, "mgpuCreateHandlesForStream", ValueRange{streamPtr});
 
     // 根据是否为标量操作选择合适的函数
     func::FuncOp funcOp;
@@ -1062,9 +1062,9 @@ public:
     
     // 创建 CUDA 流
     auto moduleOp = subOp->getParentOfType<ModuleOp>();
-    auto currentFunc = subOp->getParentOfType<func::FuncOp>();
+    // auto currentFunc = subOp->getParentOfType<func::FuncOp>();
 
-    ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
+    // ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
 
     func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
     
@@ -1078,7 +1078,7 @@ public:
       streamCreateFunc.setPrivate();
     }
 
-    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuAcquirePooledHandles");
+    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuCreateHandlesForStream");
 
     if (!handleCreateFunc) {
       OpBuilder::InsertionGuard guard(rewriter);
@@ -1086,7 +1086,7 @@ public:
       
       auto handleCreateType = rewriter.getFunctionType({ptrType}, {});
       handleCreateFunc = rewriter.create<func::FuncOp>(
-        loc, "mgpuAcquirePooledHandles", handleCreateType);
+        loc, "mgpuCreateHandlesForStream", handleCreateType);
       handleCreateFunc.setPrivate();
     }
     
@@ -1095,7 +1095,7 @@ public:
     auto streamPtr = streamCallOp.getResult(0);
     
     rewriter.create<func::CallOp>(
-      loc, TypeRange{}, "mgpuAcquirePooledHandles", ValueRange{streamPtr});
+      loc, TypeRange{}, "mgpuCreateHandlesForStream", ValueRange{streamPtr});
 
     // 根据是否为标量操作选择合适的函数
     func::FuncOp funcOp;
@@ -1464,9 +1464,9 @@ public:
     
     // 创建 CUDA 流
     auto moduleOp = mulOp->getParentOfType<ModuleOp>();
-    auto currentFunc = mulOp->getParentOfType<func::FuncOp>();
+    // auto currentFunc = mulOp->getParentOfType<func::FuncOp>();
 
-    ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
+    // ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
 
     func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
     
@@ -1480,7 +1480,7 @@ public:
       streamCreateFunc.setPrivate();
     }
 
-    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuAcquirePooledHandles");
+    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuCreateHandlesForStream");
 
     if (!handleCreateFunc) {
       OpBuilder::InsertionGuard guard(rewriter);
@@ -1488,7 +1488,7 @@ public:
       
       auto handleCreateType = rewriter.getFunctionType({ptrType}, {});
       handleCreateFunc = rewriter.create<func::FuncOp>(
-        loc, "mgpuAcquirePooledHandles", handleCreateType);
+        loc, "mgpuCreateHandlesForStream", handleCreateType);
       handleCreateFunc.setPrivate();
     }
     
@@ -1497,7 +1497,7 @@ public:
     auto streamPtr = streamCallOp.getResult(0);
     
     rewriter.create<func::CallOp>(
-      loc, TypeRange{}, "mgpuAcquirePooledHandles", ValueRange{streamPtr});
+      loc, TypeRange{}, "mgpuCreateHandlesForStream", ValueRange{streamPtr});
 
     // 根据是否为标量操作选择合适的函数
     func::FuncOp funcOp;
@@ -1680,9 +1680,9 @@ public:
     
     // Create a CUDA stream
     auto moduleOp = negOp->getParentOfType<ModuleOp>();
-    auto currentFunc = negOp->getParentOfType<func::FuncOp>();
+    // auto currentFunc = negOp->getParentOfType<func::FuncOp>();
 
-    ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
+    // ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
 
     func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
     
@@ -1696,7 +1696,7 @@ public:
       streamCreateFunc.setPrivate();
     }
 
-    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuAcquirePooledHandles");
+    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuCreateHandlesForStream");
 
     if (!handleCreateFunc) {
       OpBuilder::InsertionGuard guard(rewriter);
@@ -1704,7 +1704,7 @@ public:
       
       auto handleCreateType = rewriter.getFunctionType({ptrType}, {});
       handleCreateFunc = rewriter.create<func::FuncOp>(
-        loc, "mgpuAcquirePooledHandles", handleCreateType);
+        loc, "mgpuCreateHandlesForStream", handleCreateType);
       handleCreateFunc.setPrivate();
     }
     
@@ -1713,7 +1713,7 @@ public:
     auto streamPtr = streamCallOp.getResult(0);
     
     rewriter.create<func::CallOp>(
-      loc, TypeRange{}, "mgpuAcquirePooledHandles", ValueRange{streamPtr});
+      loc, TypeRange{}, "mgpuCreateHandlesForStream", ValueRange{streamPtr});
 
     // Look up or create the mgpuCudnnNeg function
     func::FuncOp funcOp = moduleOp.lookupSymbol<func::FuncOp>("mgpuCudnnNeg");
@@ -1884,9 +1884,9 @@ public:
     
     // 创建CUDA流
     auto moduleOp = matMulOp->getParentOfType<ModuleOp>();
-    auto currentFunc = matMulOp->getParentOfType<func::FuncOp>();
+    // auto currentFunc = matMulOp->getParentOfType<func::FuncOp>();
 
-    ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
+    // ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
 
     func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
     
@@ -1900,7 +1900,7 @@ public:
       streamCreateFunc.setPrivate();
     }
 
-    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuAcquirePooledHandles");
+    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuCreateHandlesForStream");
 
     if (!handleCreateFunc) {
       OpBuilder::InsertionGuard guard(rewriter);
@@ -1908,7 +1908,7 @@ public:
       
       auto handleCreateType = rewriter.getFunctionType({ptrType}, {});
       handleCreateFunc = rewriter.create<func::FuncOp>(
-        loc, "mgpuAcquirePooledHandles", handleCreateType);
+        loc, "mgpuCreateHandlesForStream", handleCreateType);
       handleCreateFunc.setPrivate();
     }
     
@@ -1917,7 +1917,7 @@ public:
     auto streamPtr = streamCallOp.getResult(0);
     
     rewriter.create<func::CallOp>(
-      loc, TypeRange{}, "mgpuAcquirePooledHandles", ValueRange{streamPtr});
+      loc, TypeRange{}, "mgpuCreateHandlesForStream", ValueRange{streamPtr});
   
     // 创建或查找FC函数声明
     func::FuncOp fcFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuCulibsFullyConnectedForward");
@@ -2179,9 +2179,9 @@ public:
     
     // 创建CUDA流
     auto moduleOp = gemmOp->getParentOfType<ModuleOp>();
-    auto currentFunc = gemmOp->getParentOfType<func::FuncOp>();
+    // auto currentFunc = gemmOp->getParentOfType<func::FuncOp>();
 
-    ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
+    // ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
 
     func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
     
@@ -2195,7 +2195,7 @@ public:
       streamCreateFunc.setPrivate();
     }
 
-    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuAcquirePooledHandles");
+    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuCreateHandlesForStream");
 
     if (!handleCreateFunc) {
       OpBuilder::InsertionGuard guard(rewriter);
@@ -2203,7 +2203,7 @@ public:
       
       auto handleCreateType = rewriter.getFunctionType({ptrType}, {});
       handleCreateFunc = rewriter.create<func::FuncOp>(
-        loc, "mgpuAcquirePooledHandles", handleCreateType);
+        loc, "mgpuCreateHandlesForStream", handleCreateType);
       handleCreateFunc.setPrivate();
     }
     
@@ -2212,7 +2212,7 @@ public:
     auto streamPtr = streamCallOp.getResult(0);
     
     rewriter.create<func::CallOp>(
-      loc, TypeRange{}, "mgpuAcquirePooledHandles", ValueRange{streamPtr});
+      loc, TypeRange{}, "mgpuCreateHandlesForStream", ValueRange{streamPtr});
 
     // 创建或查找FC函数声明
     func::FuncOp fcFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuCulibsFullyConnectedForward");
@@ -2465,9 +2465,9 @@ public:
     
     // Create a CUDA stream
     auto moduleOp = gemmOp->getParentOfType<ModuleOp>();
-    auto currentFunc = gemmOp->getParentOfType<func::FuncOp>();
+    // auto currentFunc = gemmOp->getParentOfType<func::FuncOp>();
 
-    ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
+    // ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
 
     func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
     
@@ -2481,7 +2481,7 @@ public:
       streamCreateFunc.setPrivate();
     }
 
-    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuAcquirePooledHandles");
+    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuCreateHandlesForStream");
 
     if (!handleCreateFunc) {
       OpBuilder::InsertionGuard guard(rewriter);
@@ -2489,7 +2489,7 @@ public:
       
       auto handleCreateType = rewriter.getFunctionType({ptrType}, {});
       handleCreateFunc = rewriter.create<func::FuncOp>(
-        loc, "mgpuAcquirePooledHandles", handleCreateType);
+        loc, "mgpuCreateHandlesForStream", handleCreateType);
       handleCreateFunc.setPrivate();
     }
     
@@ -2498,7 +2498,7 @@ public:
     auto streamPtr = streamCallOp.getResult(0);
     
     rewriter.create<func::CallOp>(
-      loc, TypeRange{}, "mgpuAcquirePooledHandles", ValueRange{streamPtr});
+      loc, TypeRange{}, "mgpuCreateHandlesForStream", ValueRange{streamPtr});
 
     // Create or locate the flatten-FC function declaration
     func::FuncOp fcFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuCulibsFlattenFullyConnectedForward");
@@ -2712,9 +2712,9 @@ public:
     
     // Create a CUDA stream
     auto moduleOp = matMulOp->getParentOfType<ModuleOp>();
-    auto currentFunc = matMulOp->getParentOfType<func::FuncOp>();
+    // auto currentFunc = matMulOp->getParentOfType<func::FuncOp>();
 
-    ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
+    // ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
 
     func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
     
@@ -2728,7 +2728,7 @@ public:
       streamCreateFunc.setPrivate();
     }
 
-    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuAcquirePooledHandles");
+    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuCreateHandlesForStream");
 
     if (!handleCreateFunc) {
       OpBuilder::InsertionGuard guard(rewriter);
@@ -2736,7 +2736,7 @@ public:
       
       auto handleCreateType = rewriter.getFunctionType({ptrType}, {});
       handleCreateFunc = rewriter.create<func::FuncOp>(
-        loc, "mgpuAcquirePooledHandles", handleCreateType);
+        loc, "mgpuCreateHandlesForStream", handleCreateType);
       handleCreateFunc.setPrivate();
     }
     
@@ -2745,7 +2745,7 @@ public:
     auto streamPtr = streamCallOp.getResult(0);
 
     rewriter.create<func::CallOp>(
-      loc, TypeRange{}, "mgpuAcquirePooledHandles", ValueRange{streamPtr});
+      loc, TypeRange{}, "mgpuCreateHandlesForStream", ValueRange{streamPtr});
     
     // Create or locate the flatten-FC function declaration
     func::FuncOp fcFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuCulibsFlattenFullyConnectedForward");
@@ -3009,9 +3009,9 @@ public:
     
     // 创建CUDA流
     auto moduleOp = maxPoolOp->getParentOfType<ModuleOp>();
-    auto currentFunc = maxPoolOp->getParentOfType<func::FuncOp>();
+    // auto currentFunc = maxPoolOp->getParentOfType<func::FuncOp>();
 
-    ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
+    // ensureHandlePoolInitialization(moduleOp, rewriter, loc, ptrType, currentFunc);
 
     func::FuncOp streamCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuStreamCreate");
     
@@ -3025,7 +3025,7 @@ public:
       streamCreateFunc.setPrivate();
     }
 
-    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuAcquirePooledHandles");
+    func::FuncOp handleCreateFunc = moduleOp.lookupSymbol<func::FuncOp>("mgpuCreateHandlesForStream");
 
     if (!handleCreateFunc) {
       OpBuilder::InsertionGuard guard(rewriter);
@@ -3033,7 +3033,7 @@ public:
       
       auto handleCreateType = rewriter.getFunctionType({ptrType}, {});
       handleCreateFunc = rewriter.create<func::FuncOp>(
-        loc, "mgpuAcquirePooledHandles", handleCreateType);
+        loc, "mgpuCreateHandlesForStream", handleCreateType);
       handleCreateFunc.setPrivate();
     }
     
@@ -3042,7 +3042,7 @@ public:
     auto streamPtr = streamCallOp.getResult(0);
 
     rewriter.create<func::CallOp>(
-      loc, TypeRange{}, "mgpuAcquirePooledHandles", ValueRange{streamPtr});
+      loc, TypeRange{}, "mgpuCreateHandlesForStream", ValueRange{streamPtr});
     
     // 查找或创建mgpuCudnnMaxPoolForward函数
     func::FuncOp funcOp = moduleOp.lookupSymbol<func::FuncOp>("mgpuCudnnMaxPoolForward");
