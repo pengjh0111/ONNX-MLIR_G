@@ -108,6 +108,8 @@ std::unique_ptr<mlir::Pass> createLowerToStablehloPass(bool enableUnroll);
 /// Pass for eliding the values of global Krnl operations.
 std::unique_ptr<mlir::Pass> createElideConstGlobalValuePass();
 
+std::unique_ptr<mlir::Pass> createCudaPoolConversionPass(); //modified by p
+
 std::unique_ptr<mlir::Pass> createRedundantPointerConversionPass(); //modified by p
 
 std::unique_ptr<mlir::Pass> createONNXToCuDNNPass(); //modified by p

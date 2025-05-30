@@ -37,6 +37,10 @@ void registerOMPasses(int optLevel) {
   // function to make themselves available as a command-line option.
 
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modified by p
+    return createCudaPoolConversionPass();
+  });
+
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { //modified by p
     return createRedundantPointerConversionPass();
   });
 

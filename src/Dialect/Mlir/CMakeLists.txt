@@ -16,6 +16,7 @@ add_onnx_mlir_library(OMMlirDialects
   TileSizeOptimizer.cpp
   ConvertONNXToculibs.cpp
   EliminateRedundantPtrConversion.cpp
+  UseHandleStreamPool.cpp
 
   DEPENDS
   OMKrnlIncGen
