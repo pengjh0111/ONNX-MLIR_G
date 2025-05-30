@@ -182,7 +182,7 @@ void reorganizeIR(func::FuncOp funcOp, DependencyGraph &graph) {
         // 创建handles for stream
         builder.create<func::CallOp>(
           funcOp.getLoc(),
-          "mgpuAcquirePooledHandles",
+          "mgpuCreateHandlesForStream",
           TypeRange{},
           ValueRange{streamCreateOp.getResult(0)});
       }
@@ -214,26 +214,91 @@ void reorganizeIR(func::FuncOp funcOp, DependencyGraph &graph) {
     }
     
     // 步骤4：处理当前级别的所有节点
+    // unsigned kernelIndex = 0;
+    // unsigned culibsIndex = 0;
+    
+    // for (auto node : nodesAtLevel) {
+    //   builder.setInsertionPointToEnd(newBlock);
+      
+    //   if (node->type == NodeType::Kernel) {
+    //     Value waitToken = kernelWaitTokens[kernelIndex++];
+    //     Value kernelToken = processKernelNode(node, builder, mapper, waitToken, processedOps);
+    //     currentLevelTokens.push_back(kernelToken);
+    //   } 
+    //   else if (node->type == NodeType::Loop) {
+    //     processLoopNode(node, builder, mapper, allocaOps, processedOps);
+    //   } 
+    //   else if (node->type == NodeType::CuLibs) {
+    //     Value stream = culibsStreams[culibsIndex++];
+    //     processCuLibsNodeWithStream(node, builder, mapper, processedOps, stream);
+    //   }
+    // }
+    
+    // 对当前级别的节点进行排序：Kernel 节点优先
+    llvm::SmallVector<DependencyNode*, 8> sortedNodes;
+    llvm::SmallVector<DependencyNode*, 8> kernelNodes;
+    llvm::SmallVector<DependencyNode*, 8> loopNodes;  
+    llvm::SmallVector<DependencyNode*, 8> culibsNodes;
+
+    // 分离不同类型的节点
+    for (auto node : nodesAtLevel) {
+      switch (node->type) {
+        case NodeType::Kernel:
+          kernelNodes.push_back(node);
+          break;
+        case NodeType::Loop:
+          loopNodes.push_back(node);
+          break;
+        case NodeType::CuLibs:
+          culibsNodes.push_back(node);
+          break;
+        default:
+          // 处理未知类型，保守地放在最后
+          llvm::errs() << "Warning: Unknown node type encountered\n";
+          break;
+      }
+    }
+
+    // 按优先级排序：Kernel > Loop > CuLibs
+    // Kernel 节点优先，因为它们通常执行时间更长，先启动可以获得更好的并行效果
+    sortedNodes.append(kernelNodes.begin(), kernelNodes.end());
+    sortedNodes.append(loopNodes.begin(), loopNodes.end());
+    sortedNodes.append(culibsNodes.begin(), culibsNodes.end());
+
+    // llvm::errs() << "Level " << level << " execution order optimization: " 
+    //              << kernelNodes.size() << " kernels first, then " 
+    //              << loopNodes.size() << " loops, then " 
+    //              << culibsNodes.size() << " culibs calls\n";
+
     unsigned kernelIndex = 0;
     unsigned culibsIndex = 0;
-    
-    for (auto node : nodesAtLevel) {
+
+    // 按排序后的顺序处理节点
+    for (auto node : sortedNodes) {
       builder.setInsertionPointToEnd(newBlock);
       
       if (node->type == NodeType::Kernel) {
         Value waitToken = kernelWaitTokens[kernelIndex++];
         Value kernelToken = processKernelNode(node, builder, mapper, waitToken, processedOps);
         currentLevelTokens.push_back(kernelToken);
+        
+        // llvm::errs() << "  Processed kernel: " << node->kernelModuleName 
+        //              << "::" << node->kernelName << " (index " << (kernelIndex-1) << ")\n";
       } 
       else if (node->type == NodeType::Loop) {
         processLoopNode(node, builder, mapper, allocaOps, processedOps);
+        
+        // llvm::errs() << "  Processed loop node\n";
       } 
       else if (node->type == NodeType::CuLibs) {
         Value stream = culibsStreams[culibsIndex++];
         processCuLibsNodeWithStream(node, builder, mapper, processedOps, stream);
+        
+        // llvm::errs() << "  Processed culibs call: " << node->culibsFunctionName 
+        //              << " (index " << (culibsIndex-1) << ")\n";
       }
     }
-    
+
     // 步骤5：同步和销毁所有streams
     for (Value stream : culibsStreams) {
       builder.setInsertionPointToEnd(newBlock);
